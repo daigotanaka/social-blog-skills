@@ -216,6 +216,30 @@ python3 scripts/x_com.py publish <article_id> [--visibility Public]
 
 Uses `ArticleEntityPublish` with `visibilitySetting` (default `Public`). Returns the resulting `lifecycle` (`Published`).
 
+> [!WARNING]
+> **Publishing is rate-limited and can be flagged as automation.** `publish` (and
+> `unpublish`/`delete`) are account "write" actions. X can reject them with an
+> `AuthorizationError` even when your cookies are valid and the code is correct.
+> Two distinct errors show up:
+>
+> | Code | Message | Meaning | What to do |
+> |---|---|---|---|
+> | **344** | "You have reached your daily limit for sending Tweets and messages. Please try again later." | Hard daily write cap reached | Wait for the ~24h rolling window to clear; don't retry sooner. |
+> | **226** | "This request looks like it might be automated. To protect our users from spam and other malicious activity, we can't complete this action right now. Please try again later." | Anti-spam / bot-detection heuristic tripped | **Back off and wait (longer than 344).** Do **not** retry in a loop — repeated automated attempts make it worse. |
+>
+> **Error 226 is transient, not a bug.** In practice the *same* `publish` command
+> that returned 226 succeeded later after a longer cool-down. What trips it is
+> **behavior, not credentials**: bursts of automated writes, or a fresh headless
+> session firing publishes back-to-back (e.g. a scheduled task retrying too
+> aggressively). Mitigations:
+>
+> - Space out writes; avoid publishing several articles in quick succession.
+> - If a scheduled/automated publish returns 226, let it fail and retry **hours**
+>   later — not minutes. Don't put `publish` in a tight retry loop.
+> - If it needs to go out urgently, publish that one manually from the X web UI.
+> - Heavy debugging that creates/deletes many drafts can prime both limits; give
+>   the account a rest before publishing for real.
+
 ## Unpublishing
 
 ```bash
@@ -323,6 +347,7 @@ The article id used in requests is the numeric `rest_id` (e.g. `2074335832941719
 
 - **Query IDs rotate.** The `<queryId>` per operation is baked into the current web bundle. When a call fails with HTTP 404 or a persisted-query error, recapture a HAR of the article flow and update the `_Q` map in `scripts/x_com.py`.
 - **Cookies expire.** HTTP 401/403 usually means a stale `auth_token`/`ct0`. Grab fresh cookies from the browser.
+- **Write limits & automation flags (`AuthorizationError` 344 / 226).** Publishing can be rejected even with valid auth: `344` = daily write cap (wait ~24h), `226` = "looks automated" anti-spam block (back off for hours, never loop-retry). See the warning under [Publishing](#publishing). These are account-level, not code bugs.
 - **`ct0` must match the cookie.** The `x-csrf-token` header must equal the `ct0` cookie value; the script keeps them in sync automatically.
 - **Cover uploads** go to `upload.x.com` (a different host from the GraphQL API) and send the whole image as a single APPEND segment — fine for cover-sized JP/PNG images, but very large files would need real multi-segment chunking, which is not implemented.
 - **`x-client-transaction-id`.** The web app sends a per-request `x-client-transaction-id` header that this client omits. GraphQL article endpoints have accepted requests without it, but if X tightens verification and calls start failing, that header may need to be generated.

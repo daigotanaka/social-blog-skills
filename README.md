@@ -17,6 +17,51 @@ credentials, cookies, and HAR files as sensitive secrets.
 | Substack | [substack/SKILL.md](substack/SKILL.md) | Post short notes, save article drafts, fetch drafts, list articles, upload images, run prepublish checks, and publish existing drafts. |
 | X.com Articles | [x-com/SKILL.md](x-com/SKILL.md) | Create Markdown article drafts, set title/content/cover, publish, unpublish, and list draft or published long-form articles. |
 
+## How to get started
+
+### If you are new to Claude Code, Codex, or AI agents
+
+Ask ChatGPT or Claude:
+
+```
+I want to use https://github.com/daigotanaka/social-blog-skills
+in a coding agent, but I have never used Claude Code or Codex.
+How would I get started? Tell me step by step.
+```
+
+### If you already have Claude Code, Codex, or other AI agents running
+
+This repository is designed to be used by AI coding agents such as Claude Code,
+Codex, and similar local automation tools. Start by asking the agent to inspect
+this README, then open the `SKILL.md` for the platform you want to use. The
+skill file describes the expected authentication method, supported workflows,
+and helper script commands.
+
+A good first prompt is:
+
+```text
+Read this repository's README and the SKILL.md for <platform>. Help me set up
+the local secrets safely, then run the smallest read-only command that verifies
+the integration works.
+```
+
+For most workflows, the agent should:
+
+1. Choose the platform folder from the table above.
+2. Read that platform's `SKILL.md` completely before running commands.
+3. Put credentials, cookies, API tokens, and HAR captures in a local `.secrets/`
+   directory, never in tracked files.
+4. Prefer read-only or draft-only commands first, such as listing drafts,
+   fetching an existing draft, or saving a new unpublished draft.
+5. Show the exact command it plans to run before any action that publishes,
+   schedules, deletes, or modifies public content.
+6. Redact secrets from logs, command output, pull requests, and issue reports.
+
+These integrations often depend on browser-derived cookies or private web API
+behavior. If a command fails, the most useful next step is usually to have the
+agent inspect the relevant helper script, compare it with a fresh browser HAR
+capture for the same workflow, and make a small tested update.
+
 ## HAR/API exploration
 
 The [har/SKILL.md](har/SKILL.md) skill is not a posting platform integration.
