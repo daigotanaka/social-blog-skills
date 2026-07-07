@@ -88,6 +88,61 @@ _Q = {
     "ArticleEntitiesSlice": "dDmkonrnmZCNvGAddHYSHQ",
 }
 
+
+def _strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_front_matter_value(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    if value[0] in ("[", "{"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    if "," in value:
+        return [_strip_wrapping_quotes(part) for part in value.split(",") if part.strip()]
+    return _strip_wrapping_quotes(value)
+
+
+def parse_markdown_front_matter(markdown_text: str) -> Tuple[str, Dict[str, Any]]:
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.startswith("---\n"):
+        return markdown_text, {}
+
+    lines = normalized.split("\n")
+    end_index = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            end_index = index
+            break
+    if end_index is None:
+        return markdown_text, {}
+
+    metadata: Dict[str, Any] = {}
+    for line in lines[1:end_index]:
+        if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        metadata[key.strip().lower().replace("-", "_")] = _parse_front_matter_value(value)
+
+    body = "\n".join(lines[end_index + 1:])
+    return body.lstrip("\n"), metadata
+
+
+def _metadata_text(metadata: Dict[str, Any], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = metadata.get(key)
+        if value is not None and not isinstance(value, (list, dict)):
+            return str(value)
+    return None
+
+
 # Feature flags the endpoints expect. Sent verbatim on every request.
 _FEATURES = {
     "profile_label_improvements_pcf_label_in_post_enabled": True,
@@ -276,6 +331,7 @@ def markdown_to_content_state(markdown_text: str) -> Dict[str, Any]:
     X's schema accepts only Bold and Italic, so backticks and ``_`` are left
     literal. Blank lines separate blocks.
     """
+    markdown_text, _metadata = parse_markdown_front_matter(markdown_text)
     blocks: List[Dict[str, Any]] = []
     entity_map: List[Dict[str, Any]] = []
     lines = markdown_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -613,7 +669,7 @@ class XCom:
 
     def create_article(
         self,
-        title: str,
+        title: Optional[str],
         body_file: Optional[str] = None,
         markdown: Optional[str] = None,
         cover_media_id: Optional[str] = None,
@@ -629,6 +685,11 @@ class XCom:
         if markdown is None and body_file is not None:
             with open(body_file, "r", encoding="utf-8") as f:
                 markdown = f.read()
+        if markdown is not None:
+            markdown, metadata = parse_markdown_front_matter(markdown)
+            title = title or _metadata_text(metadata, "title")
+        if not title:
+            raise ValueError("title is required. Provide --title or front matter title in --body-file.")
         content_state = markdown_to_content_state(markdown) if markdown is not None else None
 
         shell = self.create_draft_shell()
@@ -749,7 +810,7 @@ def main() -> int:
 
     # --- draft (full create flow) ---
     d_p = sub.add_parser("draft", help="Create an article draft from markdown (create+title+content)")
-    d_p.add_argument("--title", required=True, help="Article title")
+    d_p.add_argument("--title", help="Article title")
     d_p.add_argument("--body-file", help="Path to markdown body file")
     d_p.add_argument("--cover-image", help="Local image file to upload and set as cover")
     d_p.add_argument("--cover-media-id", help="Already-uploaded media id to set as cover")

@@ -245,9 +245,64 @@ def _clean_markdown_inline(text: str) -> str:
     return text
 
 
+def _strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_front_matter_value(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    if value[0] in ("[", "{"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    if "," in value:
+        return [_strip_wrapping_quotes(part) for part in value.split(",") if part.strip()]
+    return _strip_wrapping_quotes(value)
+
+
+def parse_markdown_front_matter(markdown_text: str) -> tuple[str, dict[str, Any]]:
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.startswith("---\n"):
+        return markdown_text, {}
+
+    lines = normalized.split("\n")
+    end_index = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            end_index = index
+            break
+    if end_index is None:
+        return markdown_text, {}
+
+    metadata: dict[str, Any] = {}
+    for line in lines[1:end_index]:
+        if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        metadata[key.strip().lower().replace("-", "_")] = _parse_front_matter_value(value)
+
+    body = "\n".join(lines[end_index + 1:])
+    return body.lstrip("\n"), metadata
+
+
+def _metadata_text(metadata: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = metadata.get(key)
+        if value is not None and not isinstance(value, (list, dict)):
+            return str(value)
+    return None
+
+
 def markdown_to_doc(path: Path) -> dict[str, Any]:
     """Convert a conservative subset of Markdown into Substack editor JSON."""
-    lines = path.read_text(encoding="utf-8").splitlines()
+    markdown_text, _metadata = parse_markdown_front_matter(path.read_text(encoding="utf-8"))
+    lines = markdown_text.splitlines()
     nodes: list[dict[str, Any]] = []
     paragraph_buf: list[str] = []
     list_buf: list[str] = []
@@ -831,6 +886,13 @@ def _body_from_args(args: argparse.Namespace) -> dict[str, Any]:
     return doc_node(nodes)
 
 
+def _front_matter_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "body_file", None):
+        _body, metadata = parse_markdown_front_matter(args.body_file.read_text(encoding="utf-8"))
+        return metadata
+    return {}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Substack API helper.")
     parser.add_argument("--token", help="Raw substack.sid cookie value.")
@@ -891,7 +953,7 @@ def main() -> None:
     create_draft.add_argument("--byline-user-id", required=True, type=int, help="Substack user id for draft_bylines.")
     create_draft.add_argument("--draft-type", default="newsletter", help="Draft type (default: newsletter).")
     create_draft.add_argument("--title", help="Optional title to save after creating the draft.")
-    create_draft.add_argument("--subtitle", default="", help="Optional subtitle to save after creating the draft.")
+    create_draft.add_argument("--subtitle", help="Optional subtitle to save after creating the draft.")
     create_draft.add_argument("--send-email", action="store_true", help="Mark the draft as intended for subscriber email.")
     create_draft.add_argument("--body-json", type=Path, help="Path to a complete Substack doc JSON body.")
     create_draft.add_argument("--body-file", type=Path, help="Path to a markdown body file.")
@@ -921,8 +983,8 @@ def main() -> None:
     save_draft = subparsers.add_parser("save-draft", help="Save an existing Substack article draft.")
     save_draft.add_argument("draft_id", help="Existing draft id, e.g. 204727458.")
     save_draft.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
-    save_draft.add_argument("--title", required=True, help="Draft title.")
-    save_draft.add_argument("--subtitle", default="", help="Draft subtitle.")
+    save_draft.add_argument("--title", help="Draft title.")
+    save_draft.add_argument("--subtitle", help="Draft subtitle.")
     save_draft.add_argument("--byline-user-id", type=int, help="Optional Substack user id for draft_bylines.")
     save_draft.add_argument("--send-email", action="store_true", help="Mark the draft as intended for subscriber email.")
     save_draft.add_argument("--body-json", type=Path, help="Path to a complete Substack doc JSON body.")
@@ -1029,29 +1091,37 @@ def main() -> None:
             _print_article_list_summary(result)
             return
         elif args.command == "create-draft":
+            metadata = _front_matter_from_args(args)
+            title = args.title if args.title is not None else _metadata_text(metadata, "title")
+            subtitle = args.subtitle if args.subtitle is not None else (_metadata_text(metadata, "subtitle", "excerpt", "description") or "")
             result = client.create_draft(
                 publication_url=args.publication_url,
                 publication_id=args.publication_id,
                 byline_user_id=args.byline_user_id,
                 draft_type=args.draft_type,
             )
-            if args.title or args.body_json or args.body_file or args.block or args.image_url:
+            if title or args.body_json or args.body_file or args.block or args.image_url:
                 result = client.save_draft(
                     publication_url=args.publication_url,
                     draft_id=result["id"],
-                    title=args.title or "",
-                    subtitle=args.subtitle,
+                    title=title or "",
+                    subtitle=subtitle,
                     body=_body_from_args(args),
                     byline_user_id=args.byline_user_id,
                     should_send_email=args.send_email,
                     last_updated_at=result.get("draft_updated_at"),
                 )
         elif args.command == "save-draft":
+            metadata = _front_matter_from_args(args)
+            title = args.title if args.title is not None else _metadata_text(metadata, "title")
+            if title is None:
+                raise ValueError("Missing title. Provide --title or front matter title in --body-file.")
+            subtitle = args.subtitle if args.subtitle is not None else (_metadata_text(metadata, "subtitle", "excerpt", "description") or "")
             result = client.save_draft(
                 publication_url=args.publication_url,
                 draft_id=args.draft_id,
-                title=args.title,
-                subtitle=args.subtitle,
+                title=title,
+                subtitle=subtitle,
                 body=_body_from_args(args),
                 byline_user_id=args.byline_user_id,
                 should_send_email=args.send_email,

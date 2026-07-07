@@ -76,6 +76,60 @@ _DEFAULT_X_LI_TRACK = {
 }
 
 
+def _strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_front_matter_value(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    if value[0] in ("[", "{"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    if "," in value:
+        return [_strip_wrapping_quotes(part) for part in value.split(",") if part.strip()]
+    return _strip_wrapping_quotes(value)
+
+
+def parse_markdown_front_matter(markdown_text: str) -> tuple[str, dict[str, Any]]:
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.startswith("---\n"):
+        return markdown_text, {}
+
+    lines = normalized.split("\n")
+    end_index = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            end_index = index
+            break
+    if end_index is None:
+        return markdown_text, {}
+
+    metadata: dict[str, Any] = {}
+    for line in lines[1:end_index]:
+        if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        metadata[key.strip().lower().replace("-", "_")] = _parse_front_matter_value(value)
+
+    body = "\n".join(lines[end_index + 1:])
+    return body.lstrip("\n"), metadata
+
+
+def _metadata_text(metadata: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = metadata.get(key)
+        if value is not None and not isinstance(value, (list, dict)):
+            return str(value)
+    return None
+
+
 class _AppendBlockAction(argparse.Action):
     def __call__(
         self,
@@ -316,7 +370,8 @@ def content_blocks_to_html(content: list[dict[str, Any]] | None) -> str:
 
 
 def markdown_to_article(markdown_text: str) -> dict[str, Any]:
-    title: str | None = None
+    markdown_text, metadata = parse_markdown_front_matter(markdown_text)
+    title: str | None = _metadata_text(metadata, "title")
     content: list[dict[str, Any]] = []
     html_parts: list[str] = []
     paragraph: list[str] = []
@@ -436,6 +491,7 @@ def markdown_to_article(markdown_text: str) -> dict[str, Any]:
 
     return {
         "title": title,
+        "metadata": metadata,
         "content": content,
         "content_html": content_blocks_to_html(content),
     }
@@ -1079,6 +1135,15 @@ def _title_from_args(args: argparse.Namespace, required: bool = False) -> str | 
     return title
 
 
+def _subtitle_from_args(args: argparse.Namespace) -> str | None:
+    explicit = getattr(args, "subtitle", None)
+    if explicit is not None:
+        return explicit
+    article = _markdown_article_from_args(args)
+    metadata = article.get("metadata") if article else None
+    return _metadata_text(metadata or {}, "subtitle", "excerpt", "description")
+
+
 def _content_from_args(args: argparse.Namespace) -> list[dict[str, Any]] | None:
     if args.content_json:
         data = load_json_file(args.content_json)
@@ -1307,7 +1372,7 @@ def main() -> None:
             result = client.patch_article(
                 args.article,
                 title=_title_from_args(args),
-                subtitle=args.subtitle,
+                subtitle=_subtitle_from_args(args),
                 content=_content_from_args(args),
                 content_html=_content_html_from_args(args),
                 cover_image_urn=cover_urn,
@@ -1331,7 +1396,7 @@ def main() -> None:
                 post_text=load_text_arg(args.post_text, args.post_text_file, "post-text"),
                 scheduled_at=args.scheduled_at,
                 title=_title_from_args(args),
-                subtitle=args.subtitle,
+                subtitle=_subtitle_from_args(args),
                 header_image=args.header_image,
                 header_image_content_type=args.header_image_content_type,
                 cover_caption=args.cover_caption,
@@ -1355,7 +1420,7 @@ def main() -> None:
                 post_text=load_text_arg(args.post_text, args.post_text_file, "post-text"),
                 scheduled_at=args.scheduled_at,
                 title=title,
-                subtitle=args.subtitle,
+                subtitle=_subtitle_from_args(args),
                 header_image=args.header_image,
                 header_image_content_type=args.header_image_content_type,
                 cover_caption=args.cover_caption,

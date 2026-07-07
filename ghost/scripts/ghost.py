@@ -217,6 +217,74 @@ def _looks_like_markdown(path: str | Path) -> bool:
     return Path(path).suffix.lower() in {".md", ".markdown", ".mdown", ".mkd"}
 
 
+def _strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_front_matter_value(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    if value[0] in ("[", "{"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    if "," in value:
+        return [_strip_wrapping_quotes(part) for part in value.split(",") if part.strip()]
+    return _strip_wrapping_quotes(value)
+
+
+def parse_markdown_front_matter(markdown_text: str) -> tuple[str, dict[str, Any]]:
+    """Return markdown without leading YAML-ish front matter plus parsed metadata."""
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.startswith("---\n"):
+        return markdown_text, {}
+
+    lines = normalized.split("\n")
+    end_index = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            end_index = index
+            break
+    if end_index is None:
+        return markdown_text, {}
+
+    metadata: dict[str, Any] = {}
+    for line in lines[1:end_index]:
+        if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        metadata[key.strip().lower().replace("-", "_")] = _parse_front_matter_value(value)
+
+    body = "\n".join(lines[end_index + 1:])
+    return body.lstrip("\n"), metadata
+
+
+def _metadata_tags(metadata: dict[str, Any]) -> Optional[list[Any]]:
+    tags = metadata.get("tags")
+    if tags is None:
+        tags = metadata.get("tag")
+    if tags is None:
+        return None
+    if isinstance(tags, str):
+        return [tag.strip() for tag in tags.split(",") if tag.strip()]
+    if isinstance(tags, list):
+        return tags
+    return None
+
+
+def _metadata_text(metadata: dict[str, Any], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = metadata.get(key)
+        if value is not None and not isinstance(value, (list, dict)):
+            return str(value)
+    return None
+
+
 # ===================================================================
 # Markdown / summary helpers
 # ===================================================================
@@ -309,6 +377,7 @@ def _inline_markdown(text: str) -> str:
 
 
 def convert_markdown_to_html(markdown_text: str) -> str:
+    markdown_text, _metadata = parse_markdown_front_matter(markdown_text)
     try:
         from markdown import markdown as markdown_convert
     except ImportError:
@@ -321,6 +390,10 @@ def convert_markdown_to_html(markdown_text: str) -> str:
 
 
 def extract_title_from_markdown(markdown_text: str) -> str:
+    markdown_text, metadata = parse_markdown_front_matter(markdown_text)
+    title = _metadata_text(metadata, "title")
+    if title:
+        return title
     for line in markdown_text.splitlines():
         if line.startswith("# "):
             return line[2:].strip()
@@ -528,6 +601,12 @@ class Ghost:
         featured: Optional[bool] = None,
         strip_title_h1: bool = True,
     ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        if markdown is not None:
+            markdown, metadata = parse_markdown_front_matter(markdown)
+            title = title if title is not None else _metadata_text(metadata, "title")
+            tags = tags if tags is not None else _metadata_tags(metadata)
+            custom_excerpt = custom_excerpt if custom_excerpt is not None else _metadata_text(metadata, "excerpt", "description")
         title, html = self._resolve_title_and_html(title, html, markdown, strip_title_h1)
         payload_post: dict[str, Any] = {"title": title, "status": status}
         if html is not None:
@@ -567,6 +646,11 @@ class Ghost:
         strip_title_h1: bool = True,
     ) -> dict[str, Any]:
         current = _first_resource(self.fetch_post(post_id), "posts")
+        if markdown is not None:
+            markdown, metadata = parse_markdown_front_matter(markdown)
+            title = title if title is not None else _metadata_text(metadata, "title")
+            tags = tags if tags is not None else _metadata_tags(metadata)
+            custom_excerpt = custom_excerpt if custom_excerpt is not None else _metadata_text(metadata, "excerpt", "description")
         if markdown is not None:
             title, html = self._resolve_title_and_html(title, html, markdown, strip_title_h1)
 

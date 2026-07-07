@@ -130,6 +130,73 @@ def format_date(date_str: str) -> str:
     return date_str[:10]
 
 
+def _strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_front_matter_value(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    if value[0] in ("[", "{"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    if "," in value:
+        return [_strip_wrapping_quotes(part) for part in value.split(",") if part.strip()]
+    return _strip_wrapping_quotes(value)
+
+
+def parse_markdown_front_matter(markdown_text: str) -> tuple[str, dict[str, Any]]:
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.startswith("---\n"):
+        return markdown_text, {}
+
+    lines = normalized.split("\n")
+    end_index = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            end_index = index
+            break
+    if end_index is None:
+        return markdown_text, {}
+
+    metadata: dict[str, Any] = {}
+    for line in lines[1:end_index]:
+        if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        metadata[key.strip().lower().replace("-", "_")] = _parse_front_matter_value(value)
+
+    body = "\n".join(lines[end_index + 1:])
+    return body.lstrip("\n"), metadata
+
+
+def _metadata_text(metadata: dict[str, Any], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = metadata.get(key)
+        if value is not None and not isinstance(value, (list, dict)):
+            return str(value)
+    return None
+
+
+def _metadata_tags(metadata: dict[str, Any]) -> Optional[list[str]]:
+    tags = metadata.get("tags")
+    if tags is None:
+        tags = metadata.get("tag")
+    if tags is None:
+        return None
+    if isinstance(tags, str):
+        return [tag.strip() for tag in tags.split(",") if tag.strip()]
+    if isinstance(tags, list):
+        return [str(tag) for tag in tags if str(tag).strip()]
+    return None
+
+
 # ===================================================================
 # Main Client Class
 # ===================================================================
@@ -273,6 +340,7 @@ class NoteCom:
 
     @classmethod
     def _markdown_to_note_html(cls, markdown_text: str) -> str:
+        markdown_text, _metadata = parse_markdown_front_matter(markdown_text)
         return cls._with_fresh_note_uuids(md_lib.markdown(markdown_text))
 
     # ----------------------------------------------------------------
@@ -333,7 +401,7 @@ class NoteCom:
     def save_draft(
         self,
         note_id: int,
-        title: str,
+        title: Optional[str],
         body_md_file: str,
         eyecatch: Optional[Dict[str, Any]] = None,
         hashtags: Optional[list[str]] = None,
@@ -345,6 +413,11 @@ class NoteCom:
         """
         with open(body_md_file, "r", encoding="utf-8") as f:
             md_text = f.read()
+        md_text, metadata = parse_markdown_front_matter(md_text)
+        title = title or _metadata_text(metadata, "title")
+        hashtags = hashtags if hashtags is not None else _metadata_tags(metadata)
+        if not title:
+            raise ValueError("title is required. Provide --title or front matter title in --body-file.")
         html_body = self._markdown_to_note_html(md_text)
 
         headers = self._json_headers()
@@ -381,7 +454,7 @@ class NoteCom:
 
     def create_draft(
         self,
-        title: str,
+        title: Optional[str],
         body_file: str,
         eyecatch_image: Optional[str] = None,
         hashtags: Optional[list[str]] = None,
@@ -392,6 +465,12 @@ class NoteCom:
 
         Creates a draft (does not publish). Returns dict with note_id, key, status.
         """
+        with open(body_file, "r", encoding="utf-8") as f:
+            _body, metadata = parse_markdown_front_matter(f.read())
+        title = title or _metadata_text(metadata, "title")
+        hashtags = hashtags if hashtags is not None else _metadata_tags(metadata)
+        if not title:
+            return {"success": False, "error": "title is required. Provide --title or front matter title in --body-file."}
         shell = self.create_note_shell(title)
         if not shell["success"]:
             return shell
@@ -1119,7 +1198,7 @@ def main() -> int:
 
     # --- draft (create) ---
     draft_p = sub.add_parser("draft", help="Create a new draft")
-    draft_p.add_argument("--title", required=True, help="Draft title")
+    draft_p.add_argument("--title", help="Draft title")
     draft_p.add_argument("--body-file", required=True, help="Path to markdown body file")
     draft_p.add_argument("--cover", help="Cover image path")
     draft_p.add_argument("--token", help="Cookie token")
@@ -1222,11 +1301,15 @@ def main() -> int:
     try:
         # --- draft ---
         if args.command == "draft":
+            metadata: dict[str, Any] = {}
+            if args.body_file:
+                with open(args.body_file, "r", encoding="utf-8") as f:
+                    _body, metadata = parse_markdown_front_matter(f.read())
             result = client.create_draft(
-                title=args.title,
+                title=args.title if args.title is not None else _metadata_text(metadata, "title"),
                 body_file=args.body_file,
                 eyecatch_image=getattr(args, "cover", None),
-                hashtags=json.loads(args.tags) if args.tags else None,
+                hashtags=json.loads(args.tags) if args.tags else _metadata_tags(metadata),
                 width=args.width,
                 height=args.height,
             )
@@ -1300,23 +1383,25 @@ def main() -> int:
                 return 0
 
             body = None
+            metadata = {}
             if getattr(args, "body_file", None):
                 if not os.path.isfile(args.body_file):
                     print(f"Error: body file not found: {args.body_file}")
                     return 1
                 with open(args.body_file, "r", encoding="utf-8") as f:
                     md_text = f.read()
+                md_text, metadata = parse_markdown_front_matter(md_text)
                 body = client._markdown_to_note_html(md_text)
             result = client.update_draft(
                 args.note_key,
-                title=args.title,
+                title=args.title if args.title is not None else _metadata_text(metadata, "title"),
                 body=body,
                 eyecatch_url=getattr(args, "eyecatch_url", None),
                 eyecatch_image_id=getattr(args, "eyecatch_id", None),
                 eyecatch_image_type=getattr(args, "eyecatch_type", "image/jpeg"),
                 eyecatch_width=getattr(args, "eyecatch_width", None),
                 eyecatch_height=getattr(args, "eyecatch_height", None),
-                hashtags=json.loads(args.hashtags) if args.hashtags else None,
+                hashtags=json.loads(args.hashtags) if args.hashtags else _metadata_tags(metadata),
                 insert_toc_search=getattr(args, "insert_toc_search", None),
                 publish=False,
             )
