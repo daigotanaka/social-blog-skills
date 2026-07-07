@@ -68,7 +68,7 @@ python3 scripts/substack.py --token-path .secrets/substack_sid.txt \
 
 # Save an existing article draft
 python3 scripts/substack.py create-draft \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --publication-id 1324369 \
   --byline-user-id 31220959 \
   --title "API Draft Test" \
@@ -77,32 +77,32 @@ python3 scripts/substack.py create-draft \
 
 # Fetch an existing article draft
 python3 scripts/substack.py fetch-draft 204727458 \
-  --publication-url https://daigotanaka.substack.com
+  --publication-url https://example.substack.com
 
 # List published, draft, and scheduled articles
 python3 scripts/substack.py list-articles \
-  --publication-url https://daigotanaka.substack.com
+  --publication-url https://example.substack.com
 
 # List only drafts and scheduled articles
 python3 scripts/substack.py list-articles \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --state draft,scheduled
 
 # Upload and append an image to an existing draft
 python3 scripts/substack.py append-image 204728902 .secrets/qwen-image-analysis.png \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --byline-user-id 31220959
 
 # Save an existing article draft
 python3 scripts/substack.py save-draft 204727458 \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --title "Test post" \
   --subtitle "Subtitle of a test post" \
   --body-file article.md
 
 # Save an existing article draft with explicit blocks
 python3 scripts/substack.py save-draft 204727458 \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --title "Test post" \
   --subtitle "Subtitle of a test post" \
   --paragraph "Here you go..." \
@@ -116,30 +116,30 @@ python3 scripts/substack.py save-draft 204727458 \
 
 # Publish and email subscribers
 python3 scripts/substack.py prepublish 204727458 \
-  --publication-url https://daigotanaka.substack.com
+  --publication-url https://example.substack.com
 python3 scripts/substack.py publish-draft 204727458 \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --send-email
 
 # Publish without emailing subscribers
 python3 scripts/substack.py publish-draft 204727458 \
-  --publication-url https://daigotanaka.substack.com
+  --publication-url https://example.substack.com
 
 # Schedule a draft
 python3 scripts/substack.py schedule-draft 205125195 \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --trigger-at 2026-07-06T13:30:00.000Z
 
 # Schedule a draft and email subscribers at the scheduled time
 python3 scripts/substack.py schedule-draft 205125195 \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --trigger-at 2026-07-06T13:30:00.000Z \
   --send-email \
   --byline-user-id 31220959
 
 # Unschedule a draft
 python3 scripts/substack.py unschedule-draft 205125195 \
-  --publication-url https://daigotanaka.substack.com
+  --publication-url https://example.substack.com
 ```
 
 ## Posting Notes
@@ -282,10 +282,10 @@ Fetch it with the CLI:
 
 ```bash
 python3 scripts/substack.py fetch-draft 204727458 \
-  --publication-url https://daigotanaka.substack.com
+  --publication-url https://example.substack.com
 
 python3 scripts/substack.py fetch-draft 204727458 \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --full
 ```
 
@@ -295,14 +295,14 @@ List article summaries by state:
 
 ```bash
 python3 scripts/substack.py list-articles \
-  --publication-url https://daigotanaka.substack.com
+  --publication-url https://example.substack.com
 
 python3 scripts/substack.py list-articles \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --state published
 
 python3 scripts/substack.py list-articles \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --state draft,scheduled \
   --limit 10
 ```
@@ -325,14 +325,14 @@ First, fetch the current draft and confirm its schedule:
 
 ```bash
 python3 scripts/substack.py fetch-draft 205126743 \
-  --publication-url https://daigotanaka.substack.com
+  --publication-url https://example.substack.com
 ```
 
 Look for `postSchedules` in the full JSON if you need the schedule id and trigger time:
 
 ```bash
 python3 scripts/substack.py fetch-draft 205126743 \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --full
 ```
 
@@ -340,7 +340,7 @@ If the existing draft body does not contain a Substack-only top image/header blo
 
 ```bash
 python3 scripts/substack.py save-draft 205126743 \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --title "If I Already Have a FastAPI Server, Why Do I Need an MCP Server?" \
   --body-file /path/to/manuscript.md
 ```
@@ -357,7 +357,7 @@ from pathlib import Path
 sys.path.insert(0, "scripts")
 import substack
 
-publication_url = "https://daigotanaka.substack.com"
+publication_url = "https://example.substack.com"
 draft_id = "205126743"
 manuscript = Path("/path/to/manuscript.md")
 
@@ -457,7 +457,7 @@ Use `--body-file <path>` with `create-draft` or `save-draft` to convert a markdo
 
 ```bash
 python3 scripts/substack.py create-draft \
-  --publication-url https://daigotanaka.substack.com \
+  --publication-url https://example.substack.com \
   --publication-id 1324369 \
   --byline-user-id 31220959 \
   --title "Article title" \

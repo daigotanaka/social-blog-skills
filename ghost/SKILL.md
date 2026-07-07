@@ -161,8 +161,8 @@ Always verify scheduling with a follow-up `fetch_post` and report both the user-
 - Markdown is converted to HTML and sent with `source=html`.
 - The first Markdown H1 becomes the title when `--title` is omitted. By default, that H1 is stripped from body HTML.
 - `python3` may not have the `markdown` package installed. `ghost.py` has a fallback converter, but high-fidelity Markdown conversion is better when `markdown` is available.
-- Draft preview URLs use the post `uuid`: `https://www.daigotanaka.com/p/<uuid>/`.
-- Public URLs use the post slug after publish: `https://www.daigotanaka.com/<slug>/` or the URL returned by Ghost.
+- Draft preview URLs use the post `uuid`: `https://www.example.com/p/<uuid>/`.
+- Public URLs use the post slug after publish: `https://www.example.com/<slug>/` or the URL returned by Ghost.
 
 ## References
 

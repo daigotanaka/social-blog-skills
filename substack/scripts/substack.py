@@ -4,7 +4,7 @@
 Usage:
     python3 scripts/substack.py post-note "Hi, I'm just looking around."
     python3 scripts/substack.py create-draft \
-        --publication-url https://daigotanaka.substack.com \
+        --publication-url https://example.substack.com \
         --publication-id 1324369 \
         --byline-user-id 31220959 \
         --title "API Draft Test" \
@@ -13,7 +13,7 @@ Usage:
         --heading "Sample Section" \
         --paragraph "Here is a second paragraph."
     python3 scripts/substack.py save-draft 204727458 \
-        --publication-url https://daigotanaka.substack.com \
+        --publication-url https://example.substack.com \
         --title "Test post" \
         --subtitle "Subtitle of a test post" \
         --paragraph "Here you go..." \
