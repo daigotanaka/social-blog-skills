@@ -1,11 +1,18 @@
 # social-blog-skills
 
-`social-blog-skills` is a collection of Codex skills and helper scripts for
+`social-blog-skills` is a collection of AI agent skills and helper scripts for
 working with social blog, newsletter, and publishing platforms.
 
+## Precaution
+
 Many of these skills use browser sessions, captured web traffic, or
-reverse-engineered private web APIs rather than official public SDKs. Treat
-credentials, cookies, and HAR files as sensitive secrets.
+reverse-engineered private web APIs rather than official public SDKs.
+
+By using this skill, you are sending requests to the platforms under
+unsupported use cases, and your account may subject to a suspention or
+termination by the platform. Please understand the risk before using it.
+(Please read the license and responsibility section very carefully before
+loading this skill into an AI agent.)
 
 ## Supported platforms
 
