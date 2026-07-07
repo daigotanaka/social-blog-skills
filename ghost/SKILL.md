@@ -63,8 +63,8 @@ Run commands from the skill root unless another working directory is clearly bet
 
 ```bash
 python3 scripts/ghost.py draft --body-file article.md
-python3 scripts/ghost.py draft --title "My Post" --body-file article.md --image cover.jpg --tags '["AI", "Ghost"]'
-python3 scripts/ghost.py update <post_id> --title "Updated title" --body-file article.md
+python3 scripts/ghost.py draft --title "My Post" --body-file article.md --image cover.jpg --tags '["AI", "Ghost"]' --featured --excerpt "Short summary"
+python3 scripts/ghost.py update <post_id> --title "Updated title" --body-file article.md --tags '["AI", "Ghost"]' --featured --excerpt "Short summary"
 python3 scripts/ghost.py publish <post_id>
 python3 scripts/ghost.py fetch <post_id>
 python3 scripts/ghost.py fetch <post_id> --body-only --output body.html
@@ -99,14 +99,16 @@ published = client.publish_post(draft["id"])
 
 Common methods:
 
-- `create_post(title=None, html=None, markdown=None, status="draft", feature_image_path=None, feature_image_alt=None, tags=None, custom_excerpt=None)`
-- `update_post(post_id, title=None, html=None, markdown=None, status=None, feature_image_path=None, clear_feature_image=False, feature_image_alt=None, tags=None, custom_excerpt=None)`
+- `create_post(title=None, html=None, markdown=None, status="draft", feature_image_path=None, feature_image_alt=None, tags=None, custom_excerpt=None, featured=None)`
+- `update_post(post_id, title=None, html=None, markdown=None, status=None, feature_image_path=None, clear_feature_image=False, feature_image_alt=None, tags=None, custom_excerpt=None, featured=None)`
 - `publish_post(post_id, title=None, html=None, markdown=None, tags=None)`
 - `fetch_post(post_id, include="tags,authors", formats="html,lexical")`
 - `list_posts(limit=15, page=1, status_filter=None, compact=False)`
 - `upload_image(image_path)`
 - `convert_markdown(markdown_text)`
 - `summarize_posts(posts_response)`
+
+`tags` may be a JSON array of tag names, e.g. `["AI", "Ghost"]`, or tag objects with `id`, `name`, and/or `slug` fields copied from Ghost Admin API responses. Use `--featured` to turn on Ghost's "Feature this post" toggle and `--unfeatured` to turn it off.
 
 ## Scheduling
 

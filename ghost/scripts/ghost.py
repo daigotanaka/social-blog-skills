@@ -172,21 +172,44 @@ def _make_admin_jwt(admin_api_key: str, ttl_seconds: int = 300) -> str:
     return f"{signing_input}.{_b64url(signature)}"
 
 
-def _normalize_tags(tags: Optional[Iterable[str]]) -> Optional[List[Dict[str, str]]]:
+def _normalize_tags(tags: Optional[Iterable[Any]]) -> Optional[List[Dict[str, str]]]:
     if tags is None:
         return None
-    return [{"name": tag.lstrip("#")} for tag in tags if tag]
+    normalized: list[dict[str, str]] = []
+    for tag in tags:
+        if not tag:
+            continue
+        if isinstance(tag, str):
+            normalized.append({"name": tag.lstrip("#")})
+            continue
+        if isinstance(tag, dict):
+            item = {
+                key: str(tag[key])
+                for key in ("id", "name", "slug")
+                if tag.get(key)
+            }
+            if item:
+                normalized.append(item)
+            continue
+        raise ValueError("Tags must be strings or objects with id/name/slug fields.")
+    return normalized
 
 
-def _parse_json_list(value: Optional[str], label: str) -> Optional[List[str]]:
+def _parse_tags(value: Optional[str], label: str) -> Optional[List[Any]]:
     if not value:
         return None
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError as exc:
         raise ValueError(f"{label} must be a JSON array, e.g. '[\"AI\", \"Ghost\"]'.") from exc
-    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-        raise ValueError(f"{label} must be a JSON array of strings.")
+    if not isinstance(parsed, list):
+        raise ValueError(f"{label} must be a JSON array.")
+    for item in parsed:
+        if isinstance(item, str):
+            continue
+        if isinstance(item, dict) and any(item.get(key) for key in ("id", "name", "slug")):
+            continue
+        raise ValueError(f"{label} entries must be strings or objects with id/name/slug fields.")
     return parsed
 
 
@@ -500,8 +523,9 @@ class Ghost:
         feature_image_path: Optional[str] = None,
         feature_image_alt: Optional[str] = None,
         feature_image_caption: Optional[str] = None,
-        tags: Optional[Iterable[str]] = None,
+        tags: Optional[Iterable[Any]] = None,
         custom_excerpt: Optional[str] = None,
+        featured: Optional[bool] = None,
         strip_title_h1: bool = True,
     ) -> dict[str, Any]:
         title, html = self._resolve_title_and_html(title, html, markdown, strip_title_h1)
@@ -510,6 +534,8 @@ class Ghost:
             payload_post["html"] = html
         if custom_excerpt is not None:
             payload_post["custom_excerpt"] = custom_excerpt
+        if featured is not None:
+            payload_post["featured"] = featured
         normalized_tags = _normalize_tags(tags)
         if normalized_tags is not None:
             payload_post["tags"] = normalized_tags
@@ -535,8 +561,9 @@ class Ghost:
         clear_feature_image: bool = False,
         feature_image_alt: Optional[str] = None,
         feature_image_caption: Optional[str] = None,
-        tags: Optional[Iterable[str]] = None,
+        tags: Optional[Iterable[Any]] = None,
         custom_excerpt: Optional[str] = None,
+        featured: Optional[bool] = None,
         strip_title_h1: bool = True,
     ) -> dict[str, Any]:
         current = _first_resource(self.fetch_post(post_id), "posts")
@@ -555,6 +582,8 @@ class Ghost:
             payload_post["status"] = status
         if custom_excerpt is not None:
             payload_post["custom_excerpt"] = custom_excerpt
+        if featured is not None:
+            payload_post["featured"] = featured
         normalized_tags = _normalize_tags(tags)
         if normalized_tags is not None:
             payload_post["tags"] = normalized_tags
@@ -582,7 +611,7 @@ class Ghost:
         title: Optional[str] = None,
         html: Optional[str] = None,
         markdown: Optional[str] = None,
-        tags: Optional[Iterable[str]] = None,
+        tags: Optional[Iterable[Any]] = None,
     ) -> dict[str, Any]:
         return self.update_post(
             post_id=post_id,
@@ -658,6 +687,8 @@ def _post_result(post: dict[str, Any], success: bool = True) -> dict[str, Any]:
         "published_at",
         "updated_at",
         "feature_image",
+        "featured",
+        "custom_excerpt",
     )
     result = {"success": success}
     result.update({key: post.get(key) for key in keys if post.get(key) is not None})
@@ -691,8 +722,15 @@ def _add_post_metadata_args(parser: argparse.ArgumentParser, *, include_clear_im
         parser.add_argument("--clear-image", action="store_true", help="Clear featured image on update")
     parser.add_argument("--image-alt", help="Featured image alt text")
     parser.add_argument("--image-caption", help="Featured image caption")
-    parser.add_argument("--tags", help='JSON tag array, e.g. ["AI", "Ghost"]')
-    parser.add_argument("--excerpt", help="Custom excerpt")
+    parser.add_argument(
+        "--tags",
+        help='JSON tag array, e.g. ["AI", "Ghost"] or [{"id":"...","name":"AI","slug":"ai"}]',
+    )
+    parser.add_argument("--excerpt", "--custom-excerpt", dest="excerpt", help="Custom excerpt")
+    featured_group = parser.add_mutually_exclusive_group()
+    featured_group.add_argument("--featured", dest="featured", action="store_true", help="Feature this post")
+    featured_group.add_argument("--unfeatured", dest="featured", action="store_false", help="Do not feature this post")
+    parser.set_defaults(featured=None)
 
 
 def main() -> int:
@@ -802,8 +840,9 @@ def main() -> int:
                 feature_image_path=args.image_file,
                 feature_image_alt=args.image_alt,
                 feature_image_caption=args.image_caption,
-                tags=_parse_json_list(args.tags, "--tags"),
+                tags=_parse_tags(args.tags, "--tags"),
                 custom_excerpt=args.excerpt,
+                featured=args.featured,
                 strip_title_h1=not args.keep_title_h1,
             )
             print(json.dumps(_post_result(result), indent=2, ensure_ascii=False))
@@ -818,7 +857,7 @@ def main() -> int:
                 title=args.title,
                 html=html,
                 markdown=markdown,
-                tags=_parse_json_list(args.tags, "--tags"),
+                tags=_parse_tags(args.tags, "--tags"),
             )
             print(json.dumps(_post_result(result), indent=2, ensure_ascii=False))
             return 0
@@ -837,8 +876,9 @@ def main() -> int:
                 clear_feature_image=args.clear_image,
                 feature_image_alt=args.image_alt,
                 feature_image_caption=args.image_caption,
-                tags=_parse_json_list(args.tags, "--tags"),
+                tags=_parse_tags(args.tags, "--tags"),
                 custom_excerpt=args.excerpt,
+                featured=args.featured,
                 strip_title_h1=not args.keep_title_h1,
             )
             print(json.dumps(_post_result(result) if result.get("success") is not False else result, indent=2, ensure_ascii=False))
