@@ -8,6 +8,7 @@ JWT required by the Admin API automatically.
 Usage (CLI):
     python3 ghost.py draft --title "My Post" --body-file post.md
     python3 ghost.py publish <post_id>
+    python3 ghost.py schedule <post_id> --published-at 2026-07-08T13:30:00.000Z
     python3 ghost.py update <post_id> --title "New title" --body-file post.md
     python3 ghost.py fetch <post_id>
     python3 ghost.py list --limit 20
@@ -211,6 +212,17 @@ def _parse_tags(value: Optional[str], label: str) -> Optional[List[Any]]:
             continue
         raise ValueError(f"{label} entries must be strings or objects with id/name/slug fields.")
     return parsed
+
+
+def _email_delivery_params(newsletter: Optional[str], email_segment: Optional[str]) -> Optional[dict[str, str]]:
+    if email_segment and not newsletter:
+        raise ValueError("--email-segment only has an effect with --newsletter. Omit both for site-only publishing.")
+    if not newsletter:
+        return None
+    params = {"newsletter": newsletter}
+    if email_segment:
+        params["email_segment"] = email_segment
+    return params
 
 
 def _looks_like_markdown(path: str | Path) -> bool:
@@ -643,6 +655,9 @@ class Ghost:
         tags: Optional[Iterable[Any]] = None,
         custom_excerpt: Optional[str] = None,
         featured: Optional[bool] = None,
+        published_at: Optional[str] = None,
+        newsletter: Optional[str] = None,
+        email_segment: Optional[str] = None,
         strip_title_h1: bool = True,
     ) -> dict[str, Any]:
         current = _first_resource(self.fetch_post(post_id), "posts")
@@ -664,6 +679,8 @@ class Ghost:
             payload_post["html"] = html
         if status is not None:
             payload_post["status"] = status
+        if published_at is not None:
+            payload_post["published_at"] = published_at
         if custom_excerpt is not None:
             payload_post["custom_excerpt"] = custom_excerpt
         if featured is not None:
@@ -685,7 +702,12 @@ class Ghost:
         if len(payload_post) == 2:
             return {"success": False, "error": "No updates specified.", "id": post_id}
 
-        params = {"source": "html"} if html is not None else None
+        params = {"source": "html"} if html is not None else {}
+        email_params = _email_delivery_params(newsletter, email_segment)
+        if email_params:
+            params.update(email_params)
+        if not params:
+            params = None
         data = self._request("PUT", f"/posts/{post_id}/", params=params, json_body={"posts": [payload_post]})
         return _first_resource(data, "posts")
 
@@ -696,6 +718,8 @@ class Ghost:
         html: Optional[str] = None,
         markdown: Optional[str] = None,
         tags: Optional[Iterable[Any]] = None,
+        newsletter: Optional[str] = None,
+        email_segment: Optional[str] = None,
     ) -> dict[str, Any]:
         return self.update_post(
             post_id=post_id,
@@ -704,6 +728,45 @@ class Ghost:
             markdown=markdown,
             status="published",
             tags=tags,
+            newsletter=newsletter,
+            email_segment=email_segment,
+        )
+
+    def schedule_post(
+        self,
+        post_id: str,
+        published_at: str,
+        title: Optional[str] = None,
+        html: Optional[str] = None,
+        markdown: Optional[str] = None,
+        tags: Optional[Iterable[Any]] = None,
+        feature_image_path: Optional[str] = None,
+        clear_feature_image: bool = False,
+        feature_image_alt: Optional[str] = None,
+        feature_image_caption: Optional[str] = None,
+        custom_excerpt: Optional[str] = None,
+        featured: Optional[bool] = None,
+        newsletter: Optional[str] = None,
+        email_segment: Optional[str] = None,
+        strip_title_h1: bool = True,
+    ) -> dict[str, Any]:
+        return self.update_post(
+            post_id=post_id,
+            title=title,
+            html=html,
+            markdown=markdown,
+            status="scheduled",
+            published_at=published_at,
+            feature_image_path=feature_image_path,
+            clear_feature_image=clear_feature_image,
+            feature_image_alt=feature_image_alt,
+            feature_image_caption=feature_image_caption,
+            tags=tags,
+            custom_excerpt=custom_excerpt,
+            featured=featured,
+            newsletter=newsletter,
+            email_segment=email_segment,
+            strip_title_h1=strip_title_h1,
         )
 
     def convert_markdown(self, markdown_text: str, strip_title_h1: bool = True) -> Tuple[str, str]:
@@ -817,6 +880,17 @@ def _add_post_metadata_args(parser: argparse.ArgumentParser, *, include_clear_im
     parser.set_defaults(featured=None)
 
 
+def _add_email_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--newsletter",
+        help="Newsletter slug. When provided, Ghost emails the post during publish/schedule.",
+    )
+    parser.add_argument(
+        "--email-segment",
+        help='Optional member filter for --newsletter, e.g. "all", "status:free", or "status:-free".',
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Unified Ghost Admin API client",
@@ -835,13 +909,24 @@ def main() -> int:
     publish_p.add_argument("post_id", help="Ghost post id")
     _add_body_args(publish_p)
     publish_p.add_argument("--tags", help='JSON tag array, e.g. ["AI", "Ghost"]')
+    _add_email_args(publish_p)
+
+    schedule_p = sub.add_parser("schedule", help="Schedule an existing post")
+    _add_auth_args(schedule_p, suppress_defaults=True)
+    schedule_p.add_argument("post_id", help="Ghost post id")
+    schedule_p.add_argument("--published-at", required=True, help="UTC publish time, e.g. 2026-07-08T13:30:00.000Z")
+    _add_body_args(schedule_p)
+    _add_post_metadata_args(schedule_p, include_clear_image=True)
+    _add_email_args(schedule_p)
 
     update_p = sub.add_parser("update", help="Update an existing post")
     _add_auth_args(update_p, suppress_defaults=True)
     update_p.add_argument("post_id", help="Ghost post id")
     _add_body_args(update_p)
     update_p.add_argument("--status", choices=("draft", "published", "scheduled"), help="New post status")
+    update_p.add_argument("--published-at", help="UTC publish time for scheduled posts, e.g. 2026-07-08T13:30:00.000Z")
     _add_post_metadata_args(update_p, include_clear_image=True)
+    _add_email_args(update_p)
 
     fetch_p = sub.add_parser("fetch", help="Fetch a post by id")
     _add_auth_args(fetch_p, suppress_defaults=True)
@@ -942,6 +1027,32 @@ def main() -> int:
                 html=html,
                 markdown=markdown,
                 tags=_parse_tags(args.tags, "--tags"),
+                newsletter=args.newsletter,
+                email_segment=args.email_segment,
+            )
+            print(json.dumps(_post_result(result), indent=2, ensure_ascii=False))
+            return 0
+
+        if args.command == "schedule":
+            html, markdown = (None, None)
+            if args.body_file:
+                html, markdown = _read_body_file(args.body_file, args.format)
+            result = client.schedule_post(
+                post_id=args.post_id,
+                published_at=args.published_at,
+                title=args.title,
+                html=html,
+                markdown=markdown,
+                feature_image_path=args.image_file,
+                clear_feature_image=args.clear_image,
+                feature_image_alt=args.image_alt,
+                feature_image_caption=args.image_caption,
+                tags=_parse_tags(args.tags, "--tags"),
+                custom_excerpt=args.excerpt,
+                featured=args.featured,
+                newsletter=args.newsletter,
+                email_segment=args.email_segment,
+                strip_title_h1=not args.keep_title_h1,
             )
             print(json.dumps(_post_result(result), indent=2, ensure_ascii=False))
             return 0
@@ -956,6 +1067,7 @@ def main() -> int:
                 html=html,
                 markdown=markdown,
                 status=args.status,
+                published_at=args.published_at,
                 feature_image_path=args.image_file,
                 clear_feature_image=args.clear_image,
                 feature_image_alt=args.image_alt,
@@ -963,6 +1075,8 @@ def main() -> int:
                 tags=_parse_tags(args.tags, "--tags"),
                 custom_excerpt=args.excerpt,
                 featured=args.featured,
+                newsletter=args.newsletter,
+                email_segment=args.email_segment,
                 strip_title_h1=not args.keep_title_h1,
             )
             print(json.dumps(_post_result(result) if result.get("success") is not False else result, indent=2, ensure_ascii=False))

@@ -66,6 +66,7 @@ python3 scripts/ghost.py draft --body-file article.md
 python3 scripts/ghost.py draft --title "My Post" --body-file article.md --image cover.jpg --tags '["AI", "Ghost"]' --featured --excerpt "Short summary"
 python3 scripts/ghost.py update <post_id> --title "Updated title" --body-file article.md --tags '["AI", "Ghost"]' --featured --excerpt "Short summary"
 python3 scripts/ghost.py publish <post_id>
+python3 scripts/ghost.py schedule <post_id> --published-at 2026-07-08T13:30:00.000Z
 python3 scripts/ghost.py fetch <post_id>
 python3 scripts/ghost.py fetch <post_id> --body-only --output body.html
 python3 scripts/ghost.py list --limit 20 --compact
@@ -100,8 +101,9 @@ published = client.publish_post(draft["id"])
 Common methods:
 
 - `create_post(title=None, html=None, markdown=None, status="draft", feature_image_path=None, feature_image_alt=None, tags=None, custom_excerpt=None, featured=None)`
-- `update_post(post_id, title=None, html=None, markdown=None, status=None, feature_image_path=None, clear_feature_image=False, feature_image_alt=None, tags=None, custom_excerpt=None, featured=None)`
-- `publish_post(post_id, title=None, html=None, markdown=None, tags=None)`
+- `update_post(post_id, title=None, html=None, markdown=None, status=None, published_at=None, feature_image_path=None, clear_feature_image=False, feature_image_alt=None, tags=None, custom_excerpt=None, featured=None, newsletter=None, email_segment=None)`
+- `publish_post(post_id, title=None, html=None, markdown=None, tags=None, newsletter=None, email_segment=None)`
+- `schedule_post(post_id, published_at, title=None, html=None, markdown=None, tags=None, feature_image_path=None, clear_feature_image=False, feature_image_alt=None, custom_excerpt=None, featured=None, newsletter=None, email_segment=None)`
 - `fetch_post(post_id, include="tags,authors", formats="html,lexical")`
 - `list_posts(limit=15, page=1, status_filter=None, compact=False)`
 - `upload_image(image_path)`
@@ -112,13 +114,31 @@ Common methods:
 
 ## Scheduling
 
-When scheduling a post, convert the requested local time to UTC and set:
+When scheduling a post, convert the requested local time to UTC and pass the UTC timestamp:
+
+```bash
+python3 scripts/ghost.py schedule <post_id> --published-at 2026-07-08T13:30:00.000Z
+```
+
+This command sets:
 
 - `status: "scheduled"`
 - `published_at: "<UTC ISO timestamp>"`
 - current `updated_at` from `fetch_post`
 
-Use this pattern:
+By default, `publish` and `schedule` publish to the blog site only and do not send email. To send email subscribers, pass a Ghost newsletter slug explicitly:
+
+```bash
+python3 scripts/ghost.py publish <post_id> --newsletter weekly-newsletter --email-segment all
+python3 scripts/ghost.py schedule <post_id> \
+  --published-at 2026-07-08T13:30:00.000Z \
+  --newsletter weekly-newsletter \
+  --email-segment all
+```
+
+`--email-segment` is optional and only works with `--newsletter`. Common values are `all`, `status:free`, and `status:-free`. Omit both `--newsletter` and `--email-segment` when the user wants to publish only on the blog site without emailing subscribers.
+
+The equivalent Python API is:
 
 ```python
 import sys
@@ -129,19 +149,7 @@ post_id = "<post_id>"
 published_at = "2026-07-08T13:30:00.000Z"
 
 client = Ghost()
-current = client.fetch_post(post_id)["posts"][0]
-updated = client._request(
-    "PUT",
-    f"/posts/{post_id}/",
-    json_body={
-        "posts": [{
-            "id": post_id,
-            "updated_at": current["updated_at"],
-            "status": "scheduled",
-            "published_at": published_at,
-        }]
-    },
-)["posts"][0]
+updated = client.schedule_post(post_id, published_at)
 ```
 
 Always verify scheduling with a follow-up `fetch_post` and report both the user-facing local time and the UTC `published_at`.
@@ -167,6 +175,8 @@ Always verify scheduling with a follow-up `fetch_post` and report both the user-
 ## References
 
 - Official Ghost Admin API overview: `https://docs.ghost.org/admin-api`
+- Official Ghost post scheduling docs: `https://docs.ghost.org/admin-api/posts/scheduling-a-post`
+- Official Ghost email sending docs: `https://docs.ghost.org/admin-api/posts/sending-a-post`
 - Admin API base URL format: `https://{admin_domain}/ghost/api/admin/`
 - Authentication reference: Admin API keys come from Ghost Admin custom integrations and are used to generate short-lived JWTs for `Authorization: Ghost <token>`.
 - Stable Admin API resources include posts, pages, tags, members, users, images, themes, site, and webhooks.
