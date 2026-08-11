@@ -6,29 +6,29 @@ This uses LinkedIn's private web API shape captured in
 HAR-native, like ../substack/scripts/substack.py, rather than a public SDK.
 
 Usage:
-    python3 scripts/linkedin.py schedule-newsletter 7478956580596654080 \
-        --content-series-urn urn:li:fsd_contentSeries:7374948590156357632 \
+    python3 scripts/linkedin.py --cred-dir .secrets schedule-newsletter <article-id> \
+        --content-series-urn urn:li:fsd_contentSeries:<newsletter-id> \
         --title "Article title" \
         --subtitle "Short article subtitle or description" \
         --header-image ./cover.jpg \
         --post-text-file ./post.txt \
         --scheduled-at 2026-07-05T09:30:00-07:00
 
-    python3 scripts/linkedin.py save-article urn:li:fsd_firstPartyArticle:7478956580596654080 \
+    python3 scripts/linkedin.py --cred-dir .secrets save-article urn:li:fsd_firstPartyArticle:<article-id> \
         --title "Article title" \
         --subtitle "Short article subtitle or description" \
         --paragraph "First paragraph." \
         --heading "Section heading" \
         --paragraph "Second paragraph."
 
-    python3 scripts/linkedin.py schedule-post 7478956580596654080 \
-        --content-series-urn 7374948590156357632 \
+    python3 scripts/linkedin.py --cred-dir .secrets schedule-post <article-id> \
+        --content-series-urn <newsletter-id> \
         --post-text "Accompanying LinkedIn post text." \
         --scheduled-at 1783344600000
 
 Usage as a module:
     from linkedin import LinkedIn
-    client = LinkedIn(cookie_path=".secrets/linkedin-cookie.txt")
+    client = LinkedIn(cred_dir=".secrets")
     client.schedule_article_share(...)
 """
 
@@ -152,13 +152,59 @@ class _AppendBlockAction(argparse.Action):
         setattr(namespace, self.dest, blocks)
 
 
-def _get_cookie(cookie: str | None = None, cookie_path: str | Path | None = None) -> str:
+def _find_credential_file(directory: Path, filename: str) -> Path | None:
+    exact_path = directory / filename
+    if exact_path.exists():
+        return exact_path
+
+    filename_lower = filename.lower()
+    for child in directory.iterdir():
+        if child.is_file() and child.name.lower() == filename_lower:
+            return child
+    return None
+
+
+def _read_credential_file(path: Path, label: str) -> str:
+    value = _strip_wrapping_quotes(path.read_text(encoding="utf-8").strip())
+    if not value:
+        raise ValueError(f"{label} credential file is empty: {path}")
+    return value
+
+
+def _get_cookie(
+    cookie: str | None = None,
+    cookie_path: str | Path | None = None,
+    cred_dir: str | Path | None = None,
+) -> str:
     if cookie:
         return cookie.strip()
     if cookie_path:
         path = Path(cookie_path)
         if path.exists():
             return path.read_text(encoding="utf-8").strip()
+    if cred_dir:
+        directory = Path(cred_dir)
+        if not directory.exists():
+            raise ValueError(f"--cred-dir does not exist: {directory}")
+        if not directory.is_dir():
+            raise ValueError(f"--cred-dir is not a directory: {directory}")
+
+        li_at_path = _find_credential_file(directory, "li_at.txt")
+        jsessionid_path = _find_credential_file(directory, "JSESSIONID.txt")
+        missing = []
+        if li_at_path is None:
+            missing.append("li_at.txt")
+        if jsessionid_path is None:
+            missing.append("JSESSIONID.txt")
+        if missing:
+            raise ValueError(
+                f"--cred-dir must contain {', '.join(missing)}. "
+                "File names are matched case-insensitively."
+            )
+
+        li_at = _read_credential_file(li_at_path, "li_at")
+        jsessionid = _read_credential_file(jsessionid_path, "JSESSIONID")
+        return f'li_at={li_at}; JSESSIONID="{jsessionid}"'
     env_cookie = os.environ.get("LINKEDIN_COOKIE", "")
     if env_cookie:
         return env_cookie.strip()
@@ -172,7 +218,8 @@ def _get_cookie(cookie: str | None = None, cookie_path: str | Path | None = None
     if DEFAULT_COOKIE_PATH.exists():
         return DEFAULT_COOKIE_PATH.read_text(encoding="utf-8").strip()
     raise ValueError(
-        "Missing LinkedIn cookie. Provide --cookie, --cookie-path, LINKEDIN_COOKIE, "
+        "Missing LinkedIn cookie. Provide --cookie, --cookie-path, --cred-dir, "
+        "LINKEDIN_COOKIE, "
         f"or {DEFAULT_COOKIE_PATH}. The cookie should include li_at and JSESSIONID."
     )
 
@@ -536,10 +583,11 @@ class LinkedIn:
         self,
         cookie: str | None = None,
         cookie_path: str | Path | None = None,
+        cred_dir: str | Path | None = None,
         csrf_token: str | None = None,
         timeout: float = 30.0,
     ) -> None:
-        self._cookie = _get_cookie(cookie=cookie, cookie_path=cookie_path)
+        self._cookie = _get_cookie(cookie=cookie, cookie_path=cookie_path, cred_dir=cred_dir)
         self._csrf_token = _get_csrf_token(self._cookie, csrf_token)
         self.timeout = timeout
 
@@ -1215,6 +1263,11 @@ def main() -> None:
         type=Path,
         help=f"Path to a raw LinkedIn Cookie header value (default: {DEFAULT_COOKIE_PATH}).",
     )
+    parser.add_argument(
+        "--cred-dir",
+        type=Path,
+        help="Directory containing li_at.txt and JSESSIONID.txt. File names are matched case-insensitively.",
+    )
     parser.add_argument("--csrf-token", help="LinkedIn csrf-token header value, usually the JSESSIONID cookie value.")
     parser.add_argument("--timeout", type=float, default=30.0, help="Request timeout in seconds (default: 30).")
 
@@ -1326,6 +1379,7 @@ def main() -> None:
         client = LinkedIn(
             cookie=args.cookie,
             cookie_path=args.cookie_path,
+            cred_dir=args.cred_dir,
             csrf_token=args.csrf_token,
             timeout=args.timeout,
         )

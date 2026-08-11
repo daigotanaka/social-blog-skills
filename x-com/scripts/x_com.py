@@ -174,7 +174,7 @@ def _user_id_from_twid(twid: Optional[str]) -> Optional[str]:
     """Extract the numeric user id from a ``twid`` cookie (``u%3D<id>``)."""
     if not twid:
         return None
-    # twid looks like "u=29117025" or url-encoded "u%3D29117025"
+    # twid looks like "u=<id>" or url-encoded "u%3D<id>"
     m = re.search(r"u(?:=|%3D)(\d+)", twid, re.IGNORECASE)
     return m.group(1) if m else None
 

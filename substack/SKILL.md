@@ -34,12 +34,6 @@ In this local skill directory, first look for the cookie at:
 .secrets/substack_sid.txt
 ```
 
-Older helper workflows may also have a token at:
-
-```text
-/Users/daigotanaka/projects/openclaw_skills/harprobe/.secrets/substack-token.txt
-```
-
 Keep these `.secrets/` files out of git. The file should contain only the raw cookie value, without `substack.sid=` and without surrounding quotes.
 
 ### Getting `substack.sid`

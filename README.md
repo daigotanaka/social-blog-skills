@@ -31,7 +31,7 @@ loading this skill into an AI agent.)
 Ask ChatGPT or Claude:
 
 ```
-I want to use https://github.com/daigotanaka/social-blog-skills
+I want to use a local checkout of the social-blog-skills repository
 in a coding agent, but I have never used Claude Code or Codex.
 How would I get started? Tell me step by step.
 ```

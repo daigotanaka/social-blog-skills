@@ -67,14 +67,14 @@ python3 scripts/x_com.py set-content <id> --auth-token-path a.txt --ct0-path c.t
 python3 scripts/x_com.py publish <id> --auth-token "..." --ct0 "..."
 
 # 3. A raw browser Cookie header string (include twid for list)
-python3 scripts/x_com.py list --cookie "auth_token=...; ct0=...; twid=u%3D29117025"
+python3 scripts/x_com.py list --cookie "auth_token=...; ct0=...; twid=u%3D<user-id>"
 
 # 4. A file containing that Cookie header string
 python3 scripts/x_com.py list --cookie-path .secrets/x_com_cookie.txt
 
 # 5. Environment variables
 X_AUTH_TOKEN=... X_CT0=... python3 scripts/x_com.py publish <id>
-X_COM_COOKIE="auth_token=...; ct0=...; twid=u%3D29117025" python3 scripts/x_com.py list
+X_COM_COOKIE="auth_token=...; ct0=...; twid=u%3D<user-id>" python3 scripts/x_com.py list
 ```
 
 **Default files:** with no auth flags, the client reads `.secrets/auth_token.txt`
@@ -87,7 +87,7 @@ Cookies expire — refresh them from the browser if calls start returning HTTP
 ### User id for listing
 
 `list` needs the numeric user id. It is auto-parsed from a `twid` cookie (`u=<id>`)
-when a cookie string/file is provided; otherwise pass `--user-id 29117025`. The
+when a cookie string/file is provided; otherwise pass `--user-id <user-id>`. The
 discrete `.secrets/auth_token.txt` + `.secrets/ct0.txt` files do **not** carry a
 user id, so `list` with only those two files requires `--user-id`. It is not
 needed for create/publish/unpublish.
@@ -106,8 +106,8 @@ python3 scripts/x_com.py list --status draft
 python3 scripts/x_com.py list --status published
 
 # Publish / unpublish an existing article by id
-python3 scripts/x_com.py publish 2074335832941719552
-python3 scripts/x_com.py unpublish 2074335832941719552
+python3 scripts/x_com.py publish <article_id>
+python3 scripts/x_com.py unpublish <article_id>
 ```
 
 ## Publishing Workflow
@@ -158,12 +158,12 @@ Build or edit a draft step by step:
 # Empty draft shell -> prints article_id
 python3 scripts/x_com.py create
 
-python3 scripts/x_com.py set-title 2074335832941719552 --title "New Title"
-python3 scripts/x_com.py set-content 2074335832941719552 --body-file article.md
+python3 scripts/x_com.py set-title <article_id> --title "New Title"
+python3 scripts/x_com.py set-content <article_id> --body-file article.md
 
 # Cover: upload a local image, or reuse an already-uploaded media id
-python3 scripts/x_com.py set-cover 2074335832941719552 --image cover.jpg
-python3 scripts/x_com.py set-cover 2074335832941719552 --media-id 2074335921839988736
+python3 scripts/x_com.py set-cover <article_id> --image cover.jpg
+python3 scripts/x_com.py set-cover <article_id> --media-id <media_id>
 ```
 
 ### Cover images
@@ -259,7 +259,7 @@ Uses `ArticleEntityDelete`. Works on both drafts and published articles and acce
 Python API:
 
 ```python
-client.delete_article("2074349652854603776")
+client.delete_article("<article_id>")
 ```
 
 ## Listing
@@ -341,7 +341,7 @@ All calls hit `https://x.com/i/api/graphql/<queryId>/<Operation>`:
 | `ArticleEntityDelete` | POST | Permanently delete an article |
 | `ArticleEntitiesSlice` | GET | List drafts/published, cursor-paginated |
 
-The article id used in requests is the numeric `rest_id` (e.g. `2074335832941719552`), also derivable by base64-decoding the GraphQL `id` (`ArticleEntity:<numeric>`).
+The article id used in requests is the numeric `rest_id`, also derivable by base64-decoding the GraphQL `id` (`ArticleEntity:<numeric>`).
 
 ## Pitfalls
 

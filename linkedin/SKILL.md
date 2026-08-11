@@ -17,7 +17,7 @@ The main workflow is:
 Run commands from the `linkedin` skill directory unless paths below are adjusted:
 
 ```bash
-cd /Users/daigotanaka/projects/openclaw_skills/linkedin
+cd /path/to/social-blog-skills/linkedin
 ```
 
 ## Authentication
@@ -29,31 +29,47 @@ Required values:
 - `li_at`: the main logged-in LinkedIn session cookie
 - `JSESSIONID`: used to generate the `csrf-token` header
 
-To get these values manually, log into `linkedin.com` in a browser. In Chrome:
-
-1. Right-click the LinkedIn page and choose Inspect.
-2. Open Application -> Storage -> Cookies -> `https://www.linkedin.com` or `https://linkedin.com`.
-3. Find the `li_at` and `JSESSIONID` cookie rows.
-4. Double-click the cryptic string in the Value column to highlight it.
-5. Right-click and copy the value.
-6. Make sure the copied value is URL-decoded.
-
-Recommended local file layout:
+Preferred local credential layout:
 
 ```text
 .secrets/li_at.txt
 .secrets/JSESSIONID.txt
 ```
 
-Use them like this:
+File names are matched case-insensitively, so `LI_AT.txt`, `li_at.txt`,
+`JSESSIONID.txt`, and `jsessionid.txt` are all accepted.
+
+Use the directory like this:
+
+```bash
+python3 scripts/linkedin.py \
+  --cred-dir .secrets \
+  ...
+```
+
+`JSESSIONID` may be copied from Chrome with surrounding quotes. The script normalizes this.
+
+To update `li_at.txt` and `JSESSIONID.txt`, log into `linkedin.com` in Chrome:
+
+1. Right-click the LinkedIn page and choose Inspect.
+2. Open Application -> Storage -> Cookies -> `https://www.linkedin.com` or `https://linkedin.com`.
+3. Find the `li_at` cookie row.
+4. Double-click the Value cell and copy the full value.
+5. Replace the contents of `.secrets/li_at.txt` with that value only.
+6. Find the `JSESSIONID` cookie row.
+7. Double-click the Value cell and copy the full value.
+8. Replace the contents of `.secrets/JSESSIONID.txt` with that value only.
+9. Make sure both values came from the same active Chrome session.
+
+After updating the files, run commands with `--cred-dir .secrets`.
+
+The env var form still works:
 
 ```bash
 LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
 LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
 python3 scripts/linkedin.py ...
 ```
-
-`JSESSIONID` may be copied from Chrome with surrounding quotes. The script normalizes this.
 
 Alternative raw cookie form:
 
@@ -63,18 +79,44 @@ python3 scripts/linkedin.py \
   ...
 ```
 
-If requests fail with `401`, `403`, `CSRF check failed`, or login HTML instead of JSON, refresh both cookies from the same active Chrome session.
-
-## Known URNs
-
-From the captured HARs:
+For debugging, you can also put the full raw Cookie header in one file and pass
+it with `--cookie-path`:
 
 ```text
-author profile:  urn:li:fsd_profile:ACoAAAO6oxgBYTC3L2NOWSGcsmc7s4aILfLREQ0
-newsletter:      urn:li:fsd_contentSeries:7374948590156357632
+.secrets/linkedin-cookie.txt
 ```
 
-Use these unless the target author/newsletter changes.
+The file must contain the complete Cookie header on one line:
+
+```text
+li_at=...; JSESSIONID="ajax:..."
+```
+
+Use it like this:
+
+```bash
+python3 scripts/linkedin.py \
+  --cookie-path .secrets/linkedin-cookie.txt \
+  fetch-latest-draft <article-id>
+```
+
+This is different from the two-file `li_at` and `JSESSIONID` layout above. The
+two-file layout uses the preferred `--cred-dir` option; `--cookie-path` expects
+the already-combined cookie header and is mainly useful when comparing against a
+browser request exactly.
+
+If requests fail with `401`, `403`, `CSRF check failed`, or login HTML instead of JSON, refresh both cookies from the same active Chrome session.
+
+## Account URNs
+
+Set these values for the target LinkedIn account/newsletter:
+
+```text
+author profile:  urn:li:fsd_profile:<profile-id>
+newsletter:      urn:li:fsd_contentSeries:<newsletter-id>
+```
+
+Use the author profile and newsletter/content-series URNs from the active account.
 
 ## Markdown Manuscripts
 
@@ -95,11 +137,9 @@ Links are converted to their visible text in the LinkedIn block payload. The gen
 Use `create-article` for a new draft only. This does not schedule or publish.
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py create-article \
-  --author-profile-urn urn:li:fsd_profile:ACoAAAO6oxgBYTC3L2NOWSGcsmc7s4aILfLREQ0 \
-  --content-series-urn urn:li:fsd_contentSeries:7374948590156357632 \
+python3 scripts/linkedin.py --cred-dir .secrets create-article \
+  --author-profile-urn urn:li:fsd_profile:<profile-id> \
+  --content-series-urn urn:li:fsd_contentSeries:<newsletter-id> \
   --body-file /path/to/article.md
 ```
 
@@ -130,21 +170,19 @@ urn:li:fsd_firstPartyArticle:<article-id>
 urn:li:linkedInArticle:<article-id>
 ```
 
-Do not use the scheduled share/post id from `schedule-post` output for draft editing. For example, in one verified run:
+Do not use the scheduled share/post id from `schedule-post` output for draft editing. For example:
 
 ```text
-edit with:        7479337101969317889
-also accepted:    urn:li:fsd_firstPartyArticle:7479337101969317889
-also accepted:    urn:li:linkedInArticle:7479337101969317889
-do not edit with: 7479342067001794560
+edit with:        <article-id>
+also accepted:    urn:li:fsd_firstPartyArticle:<article-id>
+also accepted:    urn:li:linkedInArticle:<article-id>
+do not edit with: <scheduled-post-id>
 ```
 
 The last value is the accompanying scheduled LinkedIn post/share id, not the article draft.
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py save-article <article-id> \
+python3 scripts/linkedin.py --cred-dir .secrets save-article <article-id> \
   --body-file /path/to/article.md
 ```
 
@@ -171,10 +209,8 @@ LinkedIn's editor displays newsletter header images in a 16:9 slot. Good target 
 Attach or replace a header image:
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py save-article <article-id> \
-  --header-image .secrets/ok-now-we-need-mcp.jpg \
+python3 scripts/linkedin.py --cred-dir .secrets save-article <article-id> \
+  --header-image .secrets/header.jpg \
   --header-image-content-type image/jpeg
 ```
 
@@ -204,10 +240,8 @@ EOF
 Schedule for an ISO datetime with timezone:
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py schedule-post <article-id> \
-  --content-series-urn urn:li:fsd_contentSeries:7374948590156357632 \
+python3 scripts/linkedin.py --cred-dir .secrets schedule-post <article-id> \
+  --content-series-urn urn:li:fsd_contentSeries:<newsletter-id> \
   --post-text-file /tmp/linkedin-post.txt \
   --scheduled-at "2026-07-06T06:30:00-07:00"
 ```
@@ -243,19 +277,16 @@ The safe edit sequence for an already scheduled newsletter is:
 Find the scheduled post:
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py list-post \
-  --author-profile-urn urn:li:fsd_profile:ACoAAAO6oxgBYTC3L2NOWSGcsmc7s4aILfLREQ0 \
+python3 scripts/linkedin.py --cred-dir .secrets list-post \
+  --author-profile-urn urn:li:fsd_profile:<profile-id> \
   --filter scheduled
 ```
 
 Then use `delete-scheduled-share` with the `scheduledPostUrn` or `scheduledShareUrn` from `list-post` output:
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py delete-scheduled-share urn:li:ugcPost:<scheduled-post-id>
+python3 scripts/linkedin.py --cred-dir .secrets \
+  delete-scheduled-share urn:li:ugcPost:<scheduled-post-id>
 ```
 
 Accepted scheduled post identifiers:
@@ -271,19 +302,14 @@ After this succeeds, use the original article draft id with `save-article`, then
 Example edit and reschedule flow:
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py delete-scheduled-share urn:li:ugcPost:<scheduled-post-id>
+python3 scripts/linkedin.py --cred-dir .secrets \
+  delete-scheduled-share urn:li:ugcPost:<scheduled-post-id>
 
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py save-article <article-id> \
+python3 scripts/linkedin.py --cred-dir .secrets save-article <article-id> \
   --body-file /path/to/article.md
 
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py schedule-post <article-id> \
-  --content-series-urn urn:li:fsd_contentSeries:7374948590156357632 \
+python3 scripts/linkedin.py --cred-dir .secrets schedule-post <article-id> \
+  --content-series-urn urn:li:fsd_contentSeries:<newsletter-id> \
   --post-text-file /tmp/linkedin-post.txt \
   --scheduled-at "2026-07-06T06:30:00-07:00"
 ```
@@ -293,11 +319,9 @@ python3 scripts/linkedin.py schedule-post <article-id> \
 Use separate steps when debugging or when preserving an existing header. Use the combined command only when all inputs are ready.
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py create-newsletter \
-  --author-profile-urn urn:li:fsd_profile:ACoAAAO6oxgBYTC3L2NOWSGcsmc7s4aILfLREQ0 \
-  --content-series-urn urn:li:fsd_contentSeries:7374948590156357632 \
+python3 scripts/linkedin.py --cred-dir .secrets create-newsletter \
+  --author-profile-urn urn:li:fsd_profile:<profile-id> \
+  --content-series-urn urn:li:fsd_contentSeries:<newsletter-id> \
   --body-file /path/to/article.md \
   --header-image .secrets/header.jpg \
   --header-image-content-type image/jpeg \
@@ -312,22 +336,20 @@ This creates a draft, saves body/title, attaches the header image, then schedule
 Fetch sharebox metadata:
 
 ```bash
-python3 scripts/linkedin.py fetch-sharebox
+python3 scripts/linkedin.py --cred-dir .secrets fetch-sharebox
 ```
 
 Fetch latest draft data for an article:
 
 ```bash
-python3 scripts/linkedin.py fetch-latest-draft <article-id>
+python3 scripts/linkedin.py --cred-dir .secrets fetch-latest-draft <article-id>
 ```
 
 List articles by state:
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py list-articles \
-  --author-profile-urn urn:li:fsd_profile:ACoAAAO6oxgBYTC3L2NOWSGcsmc7s4aILfLREQ0
+python3 scripts/linkedin.py --cred-dir .secrets list-articles \
+  --author-profile-urn urn:li:fsd_profile:<profile-id>
 ```
 
 If `--filter` is omitted, `list-articles` fetches `draft`, `scheduled`, and `published`. `--filter` is comma-separated and accepts `draft`, `scheduled`, and `published`; these map to LinkedIn article-list states `DRAFT`, `SCHEDULED`, and `PUBLISHED`.
@@ -335,10 +357,8 @@ If `--filter` is omitted, `list-articles` fetches `draft`, `scheduled`, and `pub
 List scheduled accompanying posts for newsletter articles:
 
 ```bash
-LINKEDIN_LI_AT="$(cat .secrets/li_at.txt)" \
-LINKEDIN_JSESSIONID="$(cat .secrets/JSESSIONID.txt)" \
-python3 scripts/linkedin.py list-post \
-  --author-profile-urn urn:li:fsd_profile:ACoAAAO6oxgBYTC3L2NOWSGcsmc7s4aILfLREQ0 \
+python3 scripts/linkedin.py --cred-dir .secrets list-post \
+  --author-profile-urn urn:li:fsd_profile:<profile-id> \
   --filter scheduled
 ```
 
@@ -347,7 +367,7 @@ python3 scripts/linkedin.py list-post \
 Upload a cover image without attaching it:
 
 ```bash
-python3 scripts/linkedin.py upload-cover .secrets/header.jpg --article-id <article-id>
+python3 scripts/linkedin.py --cred-dir .secrets upload-cover .secrets/header.jpg --article-id <article-id>
 ```
 
 ## Operational Notes
