@@ -26,7 +26,8 @@ Token resolution order:
 1. `--token <value>`
 2. `--token-path <path>`
 3. `SUBSTACK_SID` environment variable
-4. `.secrets/substack-token.txt`
+4. `.secrets/substack_sid.txt`
+5. `.secrets/substack-token.txt` legacy fallback
 
 In this local skill directory, first look for the cookie at:
 
@@ -48,6 +49,31 @@ The user needs to get `substack.sid` by logging into `substack.com` in a browser
 6. Double-click the cryptic string to highlight it, then right-click and copy.
 
 Save only the raw copied value in `.secrets/substack_sid.txt`.
+
+## Local Publication Config
+
+Do not hardcode a personal publication URL in tracked files. Keep per-user defaults in ignored local config or env:
+
+```json
+{
+  "publication_url": "https://example.substack.com"
+}
+```
+
+Save that as `.secrets/substack-config.json`. Publication URL resolution order is:
+
+1. command `--publication-url <url>`
+2. `SUBSTACK_PUBLICATION_URL` environment variable
+3. `.secrets/substack-config.json` field `publication_url`
+
+If the publication URL is unknown, inspect local HAR captures or browser requests in `.secrets/` and copy the request origin that matches `https://<publication-subdomain>.substack.com`; keep the discovered URL in `.secrets/substack-config.json`, not in `SKILL.md`.
+
+Global flags such as `--token`, `--token-path`, `--config`, and `--timeout` must appear before the subcommand. Subcommand flags such as `--publication-url`, `--state`, `--title`, and `--body-file` appear after the subcommand:
+
+```bash
+python3 scripts/substack.py --token-path .secrets/substack_sid.txt \
+  list-articles --publication-url https://example.substack.com
+```
 
 ## Quick Start
 
@@ -81,6 +107,19 @@ python3 scripts/substack.py list-articles \
 python3 scripts/substack.py list-articles \
   --publication-url https://example.substack.com \
   --state draft,scheduled
+
+# Use local .secrets/substack-config.json instead of passing the publication URL
+python3 scripts/substack.py list-articles --state draft,scheduled
+
+# Bulk-check draft shells vs drafts with body content
+python3 scripts/substack.py list-articles \
+  --state draft,scheduled \
+  --include-body-stats
+
+# Show only drafts and scheduled articles with non-empty body content
+python3 scripts/substack.py list-articles \
+  --state draft,scheduled \
+  --body-filter has-content
 
 # Upload and append an image to an existing draft
 python3 scripts/substack.py append-image 204728902 .secrets/qwen-image-analysis.png \
@@ -303,6 +342,8 @@ python3 scripts/substack.py list-articles \
 
 `--state` accepts `published`, `draft`, `scheduled`, or `all`, as a comma-separated list. The default is all states. Pass `--full` to print the raw JSON grouped by state.
 
+Use `--include-body-stats` with `--state draft,scheduled` to fetch draft details as needed and include `body_content_known`, `body_chars`, `body_text_chars`, and `body_has_content` in the compact output. Use `--body-filter has-content` or `--body-filter empty` to bulk separate real drafts from empty shells without manually running `fetch-draft --full` for each id.
+
 Verified list endpoints:
 
 ```text
@@ -466,7 +507,17 @@ Supported markdown structures:
 - bullet lists
 - fenced code blocks
 
-Markdown links are flattened to readable text as `label (url)` because rich link marks are not yet verified.
+Markdown inline syntax converts to Substack text marks (verified 2026-09-22 on publication daigotanaka):
+
+- `[label](https://url)` -> link mark `{"type":"link","attrs":{"href":"https://url"}}` on the label text
+- `**strong**` / `__strong__` -> `{"type":"strong"}` mark
+- `*emphasis*` / `_emphasis_` -> `{"type":"em"}` mark
+- `` `code` `` -> `{"type":"code"}` mark
+- `**[label](url)**` -> both strong and link marks on one text node
+
+A standalone image line `![alt](relative/path.png)` inside the markdown is uploaded via the API and embedded in place as a `captionedImage` node at the same position (requires `create-draft`/`save-draft` with `--body-file`; the client context is wired automatically). Missing local files raise `FileNotFoundError` rather than being dropped. `![](https://remote.url)` is not fetched; upload it separately with `upload-image`/`append-image`.
+
+Bold, italic, and link syntax that the converter does not recognize is preserved verbatim in the text node rather than silently stripped.
 
 Verified list node names from fetched Substack draft JSON are `bullet_list` and `list_item`.
 
@@ -598,6 +649,31 @@ After upload, images are embedded in `draft_body` as `captionedImage` nodes cont
 ```
 
 Use `append-image` to upload an image file, fetch the current draft timestamp, append a `captionedImage` node, and save the draft without publishing.
+
+### Header / Cover Image
+
+`save-draft` and `create-draft` accept `--cover-image <path-or-url>`: a local file is uploaded first, an https URL is attached directly. When the flag is omitted the existing cover is preserved (added 2026-09-22; earlier builds silently sent `cover_image: null` and wiped editor-set covers).
+
+To set a cover on an existing draft without touching the body:
+
+```bash
+python3 scripts/substack.py set-cover <draft_id> header.jpg \
+  --publication-url https://example.substack.com
+# or with an already-uploaded URL:
+python3 scripts/substack.py set-cover <draft_id> \
+  --cover-url https://substack-post-media.s3.amazonaws.com/public/images/xxx.jpeg
+```
+
+Markdown front matter supports `image:` (aliases `cover`, `cover_image`, `header_image`), used as the cover automatically when `--body-file` is given and `--cover-image` is not:
+
+```markdown
+---
+title: "Article"
+image: "../images/neopreneur-newsletter.png"
+---
+```
+
+Local front-matter paths resolve relative to the markdown file's directory.
 
 ### Publishing
 

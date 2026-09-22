@@ -52,8 +52,11 @@ import requests
 
 
 POST_NOTE_URL = "https://substack.com/api/v1/comment/feed"
-DEFAULT_TOKEN_PATH = Path(".secrets/substack-token.txt")
+DEFAULT_TOKEN_PATHS = (Path(".secrets/substack_sid.txt"), Path(".secrets/substack-token.txt"))
+DEFAULT_CONFIG_PATH = Path(".secrets/substack-config.json")
+UNSET = object()
 ARTICLE_STATES = ("published", "draft", "scheduled")
+BODY_FILTERS = ("any", "has-content", "empty", "unknown")
 _BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -61,7 +64,12 @@ _BROWSER_UA = (
 )
 
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_LINK_INLINE_RE = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
+_BOLD_LINK_RE = re.compile(r"\*\*\[([^\]]*)\]\(([^)\s]+)\)\*\*")
+_IMAGE_LINE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+_BOLD_RE = re.compile(r"\*\*(?!\s)(.+?)(?<!\s)\*\*|__(?!\s)(.+?)(?<!\s)__")
+_ITALIC_RE = re.compile(r"(?<![\*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)|(?<![ \w])_(?!\s)([^_\n]+?)(?<!\s)_(?![_\w])")
 
 
 class _AppendBlockAction(argparse.Action):
@@ -80,21 +88,60 @@ class _AppendBlockAction(argparse.Action):
         setattr(namespace, self.dest, blocks)
 
 
+def _read_existing_text(path: Path) -> str | None:
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+    except PermissionError:
+        return None
+    return None
+
+
 def _get_token(token: str | None = None, token_path: str | Path | None = None) -> str:
     if token:
         return token.strip()
     if token_path:
         path = Path(token_path)
-        if path.exists():
-            return path.read_text(encoding="utf-8").strip()
+        value = _read_existing_text(path)
+        if value:
+            return value
     env = os.environ.get("SUBSTACK_SID", "")
     if env:
         return env.strip()
-    if DEFAULT_TOKEN_PATH.exists():
-        return DEFAULT_TOKEN_PATH.read_text(encoding="utf-8").strip()
+    for default_path in DEFAULT_TOKEN_PATHS:
+        value = _read_existing_text(default_path)
+        if value:
+            return value
     raise ValueError(
         "Missing Substack cookie. Provide --token, --token-path, SUBSTACK_SID, "
-        f"or {DEFAULT_TOKEN_PATH}."
+        f"or one of: {', '.join(str(path) for path in DEFAULT_TOKEN_PATHS)}."
+    )
+
+
+def _load_config(config_path: str | Path | None = None) -> dict[str, Any]:
+    path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+    raw = _read_existing_text(path)
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError(f"Substack config must be a JSON object: {path}")
+    return data
+
+
+def _publication_url(value: str | None = None, config: dict[str, Any] | None = None) -> str:
+    if value:
+        return value.rstrip("/")
+    env = os.environ.get("SUBSTACK_PUBLICATION_URL", "")
+    if env:
+        return env.strip().rstrip("/")
+    config = config or {}
+    configured = config.get("publication_url")
+    if configured:
+        return str(configured).strip().rstrip("/")
+    raise ValueError(
+        "Missing publication URL. Provide --publication-url, SUBSTACK_PUBLICATION_URL, "
+        f"or publication_url in {DEFAULT_CONFIG_PATH}."
     )
 
 
@@ -130,24 +177,28 @@ def _note_payload(text: str, reply_minimum_role: str = "everyone") -> dict[str, 
     }
 
 
-def paragraph_node(text: str | None = None) -> dict[str, Any]:
+def paragraph_node(text: str | list[dict[str, Any]] | None = None) -> dict[str, Any]:
     node: dict[str, Any] = {
         "type": "paragraph",
         "attrs": {"textAlign": None},
     }
-    if text:
-        node["content"] = [{"type": "text", "text": text}]
+    if isinstance(text, list):
+        if text:
+            node["content"] = text
+    elif text:
+        node["content"] = [_text_node(text)]
     return node
 
 
-def heading_node(text: str, level: int = 1) -> dict[str, Any]:
+def heading_node(text: str | list[dict[str, Any]], level: int = 1) -> dict[str, Any]:
+    content = [_text_node(text)] if isinstance(text, str) else list(text)
     return {
         "type": "heading",
         "attrs": {
             "textAlign": None,
             "level": level,
         },
-        "content": [{"type": "text", "text": text}],
+        "content": content,
     }
 
 
@@ -170,13 +221,15 @@ def blockquote_node(children: list[dict[str, Any]] | None = None) -> dict[str, A
     }
 
 
-def bullet_list_node(items: list[str]) -> dict[str, Any]:
+def bullet_list_node(items: list) -> dict[str, Any]:
     return {
         "type": "bullet_list",
         "content": [
             {
                 "type": "list_item",
-                "content": [paragraph_node(item)],
+                "content": [
+                    paragraph_node(inline_to_nodes(item) if isinstance(item, str) else item)
+                ],
             }
             for item in items
         ],
@@ -238,6 +291,70 @@ def _data_url(path: Path, content_type: str | None = None) -> str:
     return f"data:{content_type};base64,{encoded}"
 
 
+def _text_node(s: str, marks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    node: dict[str, Any] = {"type": "text", "text": s}
+    if marks:
+        node["marks"] = marks
+    return node
+
+
+def inline_to_nodes(text: str) -> list[dict[str, Any]]:
+    """Convert a markdown inline span into Substack text nodes with marks.
+
+    Recognizes [label](url), **strong**, *emphasis*, `code`.
+    Unrecognized syntax is preserved verbatim rather than silently stripped.
+    """
+    pieces: list[tuple[str, list[Any]]] = []
+    for m in _BOLD_LINK_RE.finditer(text):
+        pieces.append((m.group(0), [m.start(), m.end(), m.group(1) or m.group(2), m.group(2), [{"type": "strong"}]]))
+    for m in _LINK_INLINE_RE.finditer(text):
+        if any(p[1][0] < m.end() and m.start() < p[1][1] for p in pieces):
+            continue
+        pieces.append((m.group(0), [m.start(), m.end(), m.group(1) or m.group(2), m.group(2), []]))
+    pieces.sort(key=lambda p: p[1][0])
+    out: list[dict[str, Any]] = []
+    pos = 0
+    for whole, (start, end, label, href, extra_marks) in pieces:
+        out.extend(_styled_nodes(text[pos:start]))
+        link_mark = {"type": "link", "attrs": {"href": href}}
+        for node in _styled_nodes(label):
+            node.setdefault("marks", []).extend(extra_marks)
+            node.setdefault("marks", []).append(link_mark)
+            out.append(node)
+        pos = end
+    out.extend(_styled_nodes(text[pos:]))
+    return out or [_text_node("")]
+
+
+def _styled_nodes(text: str) -> list[dict[str, Any]]:
+    """Split plain text on **strong** / *em* / `code` spans (links already consumed)."""
+    spans: list[tuple[int, int, list[dict[str, Any]], str]] = []
+    for m in _INLINE_CODE_RE.finditer(text):
+        spans.append((m.start(0), m.end(0), [{"type": "code"}], m.group(1)))
+    for m in _BOLD_RE.finditer(text):
+        if any(not (m.end(0) <= s or m.start(0) >= e) for s, e, _, _ in spans):
+            continue
+        spans.append((m.start(0), m.end(0), [{"type": "strong"}], m.group(1) or m.group(2)))
+    for m in _ITALIC_RE.finditer(text):
+        if any(not (m.end(0) <= s or m.start(0) >= e) for s, e, _, _ in spans):
+            continue
+        spans.append((m.start(0), m.end(0), [{"type": "em"}], m.group(1) or m.group(2)))
+    if not spans:
+        return [_text_node(text)] if text else []
+    spans.sort()
+    out: list[dict[str, Any]] = []
+    pos = 0
+    for start, end, marks, inner in spans:
+        if start < pos:
+            continue
+        out.extend(_text_node(x) for x in [text[pos:start]] if x)
+        out.append(_text_node(inner, marks))
+        pos = end
+    if pos < len(text):
+        out.append(_text_node(text[pos:]))
+    return [x for x in out if x.get("text")]
+
+
 def _clean_markdown_inline(text: str) -> str:
     text = _LINK_RE.sub(lambda match: f"{match.group(1)} ({match.group(2)})", text)
     text = _INLINE_CODE_RE.sub(lambda match: match.group(1), text)
@@ -261,6 +378,8 @@ def _parse_front_matter_value(value: str) -> Any:
             return json.loads(value)
         except json.JSONDecodeError:
             pass
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
     if "," in value:
         return [_strip_wrapping_quotes(part) for part in value.split(",") if part.strip()]
     return _strip_wrapping_quotes(value)
@@ -299,9 +418,44 @@ def _metadata_text(metadata: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
-def markdown_to_doc(path: Path) -> dict[str, Any]:
-    """Convert a conservative subset of Markdown into Substack editor JSON."""
+def markdown_to_doc(
+    path: Path,
+    client: "Substack | None" = None,
+    publication_url: str | None = None,
+    draft_id: int | str | None = None,
+) -> dict[str, Any]:
+    """Convert a conservative subset of Markdown into Substack editor JSON.
+
+    Inline `**strong**`, `*emphasis*`, `` `code` `` and `[label](url)` become
+    marked text nodes. A standalone `![alt](relative/path.png)` line is
+    uploaded via `client` and embedded in place when client/publication_url/
+    draft_id are provided; otherwise it raises instead of dropping silently.
+    """
     markdown_text, _metadata = parse_markdown_front_matter(path.read_text(encoding="utf-8"))
+    base_dir = path.parent
+
+    def _embed_image(alt: str, src: str) -> dict[str, Any]:
+        if client is None or not publication_url:
+            raise ValueError(
+                f"markdown_to_doc: image {src!r} needs client+publication_url to upload"
+            )
+        img_path = (base_dir / src).resolve() if not src.startswith(("http://", "https://")) else None
+        if img_path is None:
+            raise ValueError("markdown_to_doc: remote image URLs must be uploaded separately")
+        if not img_path.exists():
+            raise FileNotFoundError(f"markdown image not found: {img_path}")
+        uploaded = client.upload_image(publication_url, img_path, draft_id=draft_id)
+        return image_node(
+            publication_url,
+            draft_id or 0,
+            uploaded["url"],
+            uploaded["imageWidth"],
+            uploaded["imageHeight"],
+            uploaded["bytes"],
+            content_type=uploaded.get("contentType") or "image/png",
+            alt=(alt or "").strip() or None,
+        )
+
     lines = markdown_text.splitlines()
     nodes: list[dict[str, Any]] = []
     paragraph_buf: list[str] = []
@@ -313,19 +467,23 @@ def markdown_to_doc(path: Path) -> dict[str, Any]:
 
     def flush_paragraph() -> None:
         if paragraph_buf:
-            text = " ".join(part.strip() for part in paragraph_buf).strip()
-            nodes.append(paragraph_node(_clean_markdown_inline(text)))
+            joined = " ".join(part.strip() for part in paragraph_buf).strip()
+            img = _IMAGE_LINE_RE.match(joined)
+            if img:
+                nodes.append(_embed_image(img.group(1), img.group(2)))
+            else:
+                nodes.append(paragraph_node(inline_to_nodes(joined)))
             paragraph_buf.clear()
 
     def flush_list() -> None:
         if list_buf:
-            nodes.append(bullet_list_node([_clean_markdown_inline(item) for item in list_buf]))
+            nodes.append(bullet_list_node([inline_to_nodes(item) for item in list_buf]))
             list_buf.clear()
 
     def flush_quote() -> None:
         if quote_buf:
-            text = " ".join(part.strip() for part in quote_buf).strip()
-            nodes.append(blockquote_node([paragraph_node(_clean_markdown_inline(text))]))
+            quote_text = " ".join(part.strip() for part in quote_buf).strip()
+            nodes.append(blockquote_node([paragraph_node(inline_to_nodes(quote_text))]))
             quote_buf.clear()
 
     def flush_code() -> None:
@@ -365,7 +523,7 @@ def markdown_to_doc(path: Path) -> dict[str, Any]:
             flush_list()
             flush_quote()
             level = min(len(heading_match.group(1)), 3)
-            nodes.append(heading_node(_clean_markdown_inline(heading_match.group(2).strip()), level))
+            nodes.append(heading_node(inline_to_nodes(heading_match.group(2).strip()), level))
             continue
 
         if line.startswith(">"):
@@ -481,6 +639,7 @@ class Substack:
             byline_user_id=byline_user_id,
             should_send_email=bool(draft.get("should_send_email")),
             last_updated_at=draft.get("draft_updated_at"),
+            cover_image=draft.get("cover_image"),
         )
         saved["_uploaded_image"] = uploaded
         return saved
@@ -508,7 +667,10 @@ class Substack:
             timeout=self.timeout,
         )
         response.raise_for_status()
-        return response.json()
+        out = response.json()
+        if isinstance(out, dict) and "id" in out and "draft_id" not in out:
+            out["draft_id"] = out["id"]
+        return out
 
     def fetch_draft(self, publication_url: str, draft_id: int | str) -> dict[str, Any]:
         publication_url = publication_url.rstrip("/")
@@ -584,11 +746,15 @@ class Substack:
         write_comment_permissions: str = "everyone",
         meter_type: str = "none",
         last_updated_at: str | None = None,
+        cover_image: object = UNSET,
     ) -> dict[str, Any]:
         publication_url = publication_url.rstrip("/")
-        if last_updated_at is None:
+        if last_updated_at is None or cover_image is UNSET:
             current = self.fetch_draft(publication_url, draft_id)
-            last_updated_at = current.get("draft_updated_at") or current.get("updated_at")
+            if last_updated_at is None:
+                last_updated_at = current.get("draft_updated_at") or current.get("updated_at")
+            if cover_image is UNSET:
+                cover_image = current.get("cover_image")
         payload: dict[str, Any] = {
             "draft_title": title,
             "draft_subtitle": subtitle,
@@ -610,7 +776,7 @@ class Substack:
             "default_comment_sort": None,
             "should_send_email": should_send_email,
             "meter_type": meter_type,
-            "cover_image": None,
+            "cover_image": cover_image,
             "search_engine_title": None,
             "search_engine_description": None,
         }
@@ -629,6 +795,44 @@ class Substack:
         )
         response.raise_for_status()
         return response.json()
+
+    def set_cover_image(
+        self,
+        publication_url: str,
+        draft_id: int | str,
+        image_path: str | Path | None = None,
+        cover_url: str | None = None,
+        content_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload `image_path` (or use `cover_url`) and set it as the draft cover.
+
+        All other draft fields are preserved from the current server copy.
+        """
+        publication_url = publication_url.rstrip("/")
+        if bool(image_path) == bool(cover_url):
+            raise ValueError("provide exactly one of image_path / cover_url")
+        if image_path:
+            uploaded = self.upload_image(
+                publication_url, image_path, draft_id=draft_id, content_type=content_type
+            )
+            cover_url = uploaded["url"]
+        draft = self.fetch_draft(publication_url, draft_id)
+        bylines = draft.get("draftBylines") or draft.get("bylines") or []
+        body = json.loads(draft.get("draft_body") or '{"type":"doc","content":[]}')
+        return self.save_draft(
+            publication_url=publication_url,
+            draft_id=draft_id,
+            title=draft.get("draft_title") or "",
+            subtitle=draft.get("draft_subtitle") or "",
+            body=body,
+            byline_user_id=bylines[0]["id"] if bylines else None,
+            should_send_email=bool(draft.get("should_send_email")),
+            audience=draft.get("audience") or "everyone",
+            write_comment_permissions=draft.get("write_comment_permissions") or "everyone",
+            meter_type=draft.get("meter_type") or "none",
+            last_updated_at=draft.get("draft_updated_at"),
+            cover_image=cover_url,
+        )
 
     def prepublish_draft(
         self,
@@ -813,11 +1017,127 @@ def _article_posts(payload: Any) -> list[dict[str, Any]]:
     return [post for post in posts if isinstance(post, dict)]
 
 
+def _replace_article_posts(payload: Any, posts: list[dict[str, Any]]) -> Any:
+    if isinstance(payload, dict):
+        if "posts" in payload:
+            payload["posts"] = posts
+        elif "drafts" in payload:
+            payload["drafts"] = posts
+        else:
+            payload["posts"] = posts
+        return payload
+    if isinstance(payload, list):
+        return posts
+    return payload
+
+
+def _body_content_stats(draft_body: Any, known: bool = True) -> dict[str, Any]:
+    if draft_body is None:
+        return {
+            "body_content_known": known,
+            "body_chars": 0 if known else None,
+            "body_text_chars": 0 if known else None,
+            "body_has_content": False if known else None,
+        }
+
+    if isinstance(draft_body, str):
+        body_chars = len(draft_body)
+        try:
+            body = json.loads(draft_body) if draft_body else {}
+        except json.JSONDecodeError:
+            text_chars = len(draft_body.strip())
+            return {
+                "body_content_known": known,
+                "body_chars": body_chars,
+                "body_text_chars": text_chars,
+                "body_has_content": text_chars > 0,
+            }
+    elif isinstance(draft_body, dict):
+        body = draft_body
+        body_chars = len(json.dumps(draft_body, separators=(",", ":")))
+    else:
+        return {
+            "body_content_known": known,
+            "body_chars": None,
+            "body_text_chars": None,
+            "body_has_content": None,
+        }
+
+    text_parts: list[str] = []
+    media_types = {"captionedImage", "image2", "youtube2", "iframe", "tweet", "podcast_episode"}
+    has_media = False
+
+    def walk(value: Any) -> None:
+        nonlocal has_media
+        if isinstance(value, dict):
+            node_type = value.get("type")
+            if node_type in media_types:
+                has_media = True
+            text = value.get("text")
+            if isinstance(text, str):
+                text_parts.append(text)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(body)
+    text_chars = len("".join(text_parts).strip())
+    return {
+        "body_content_known": known,
+        "body_chars": body_chars,
+        "body_text_chars": text_chars,
+        "body_has_content": text_chars > 0 or has_media,
+    }
+
+
+def _draft_body_stats(post: dict[str, Any]) -> dict[str, Any]:
+    if "draft_body" not in post:
+        return _body_content_stats(None, known=False)
+    return _body_content_stats(post.get("draft_body"), known=True)
+
+
+def _attach_body_stats(
+    client: Substack,
+    publication_url: str,
+    result: dict[str, Any],
+    fetch_missing: bool = True,
+) -> None:
+    for state, payload in result.items():
+        posts = _article_posts(payload)
+        for post in posts:
+            stats = _draft_body_stats(post)
+            draft_id = post.get("id") or post.get("post_id")
+            if fetch_missing and not stats["body_content_known"] and state in ("draft", "scheduled") and draft_id:
+                fetched = client.fetch_draft(publication_url, draft_id)
+                stats = _draft_body_stats(fetched)
+            post["_body_stats"] = stats
+
+
+def _filter_by_body_content(result: dict[str, Any], body_filter: str) -> None:
+    if body_filter == "any":
+        return
+    for state, payload in list(result.items()):
+        kept = []
+        for post in _article_posts(payload):
+            stats = post.get("_body_stats") or _draft_body_stats(post)
+            has_content = stats.get("body_has_content")
+            known = bool(stats.get("body_content_known"))
+            if body_filter == "has-content" and has_content is True:
+                kept.append(post)
+            elif body_filter == "empty" and known and has_content is False:
+                kept.append(post)
+            elif body_filter == "unknown" and not known:
+                kept.append(post)
+        result[state] = _replace_article_posts(payload, kept)
+
+
 def _article_summary(post: dict[str, Any], state: str) -> dict[str, Any]:
     schedule = post.get("postSchedule") or post.get("post_schedule") or {}
     if not isinstance(schedule, dict):
         schedule = {}
-    return {
+    summary = {
         "state": state,
         "id": post.get("id") or post.get("post_id"),
         "type": post.get("type"),
@@ -830,6 +1150,10 @@ def _article_summary(post: dict[str, Any], state: str) -> dict[str, Any]:
         "is_published": post.get("is_published"),
         "is_scheduled": post.get("is_scheduled"),
     }
+    stats = post.get("_body_stats")
+    if stats:
+        summary.update(stats)
+    return summary
 
 
 def _print_article_list_summary(result: dict[str, Any]) -> None:
@@ -859,7 +1183,12 @@ def _body_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.body_json:
         return _load_body_file(args.body_json)
     if args.body_file:
-        return markdown_to_doc(args.body_file)
+        return markdown_to_doc(
+            args.body_file,
+            client=getattr(args, "_client", None),
+            publication_url=getattr(args, "publication_url", None),
+            draft_id=getattr(args, "draft_id", None),
+        )
 
     nodes: list[dict[str, Any]] = []
     for kind, value in args.block or []:
@@ -886,6 +1215,42 @@ def _body_from_args(args: argparse.Namespace) -> dict[str, Any]:
     return doc_node(nodes)
 
 
+def _cover_from_metadata(metadata: dict[str, Any], body_file) -> str | None:
+    """Front-matter image/cover/header_image key -> draft cover.
+
+    Local paths resolve relative to the markdown file; https URLs pass through.
+    """
+    raw = _metadata_text(metadata, "image", "cover", "cover_image", "header_image")
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if raw.startswith(("http://", "https://")):
+        return raw
+    if body_file is not None:
+        candidate = (Path(body_file).parent / raw).resolve()
+        if candidate.exists():
+            return str(candidate)
+    return raw
+
+
+def _resolve_cover(
+    client: "Substack",
+    publication_url: str,
+    draft_id: int | str | None,
+    cover: str | None,
+):
+    """--cover-image accepts a local path (uploaded first) or an https URL.
+
+    Returns UNSET when omitted so save_draft preserves the existing cover.
+    """
+    if not cover:
+        return UNSET
+    if cover.startswith(("http://", "https://")):
+        return cover
+    uploaded = client.upload_image(publication_url, Path(cover), draft_id=draft_id)
+    return uploaded["url"]
+
+
 def _front_matter_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "body_file", None):
         _body, metadata = parse_markdown_front_matter(args.body_file.read_text(encoding="utf-8"))
@@ -899,7 +1264,12 @@ def main() -> None:
     parser.add_argument(
         "--token-path",
         type=Path,
-        help=f"Path to raw substack.sid cookie value (default: {DEFAULT_TOKEN_PATH}).",
+        help="Path to raw substack.sid cookie value.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=f"Path to local JSON config (default: {DEFAULT_CONFIG_PATH}).",
     )
     parser.add_argument(
         "--timeout",
@@ -909,6 +1279,14 @@ def main() -> None:
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_publication_url_arg(command: argparse.ArgumentParser) -> None:
+        command.add_argument(
+            "--publication-url",
+            help="Publication origin, e.g. https://example.substack.com. "
+            "Defaults to SUBSTACK_PUBLICATION_URL or .secrets/substack-config.json.",
+        )
+
     post_note = subparsers.add_parser("post-note", help="Post a Substack note.")
     post_note.add_argument("text", help="Note text to post.")
     post_note.add_argument(
@@ -918,14 +1296,14 @@ def main() -> None:
     )
     upload_image = subparsers.add_parser("upload-image", help="Upload an image to Substack media.")
     upload_image.add_argument("image_path", type=Path, help="Image file to upload.")
-    upload_image.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(upload_image)
     upload_image.add_argument("--draft-id", help="Optional draft id for the Referer header.")
     upload_image.add_argument("--content-type", help="Override image content type.")
 
     append_image = subparsers.add_parser("append-image", help="Upload an image and append it to an existing draft.")
     append_image.add_argument("draft_id", help="Existing draft id.")
     append_image.add_argument("image_path", type=Path, help="Image file to upload and append.")
-    append_image.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(append_image)
     append_image.add_argument("--byline-user-id", type=int, help="Optional Substack user id for draft_bylines.")
     append_image.add_argument("--content-type", help="Override image content type.")
     append_image.add_argument("--alt", help="Image alt text.")
@@ -933,11 +1311,11 @@ def main() -> None:
 
     fetch_draft = subparsers.add_parser("fetch-draft", help="Fetch an existing Substack article draft.")
     fetch_draft.add_argument("draft_id", help="Existing draft id.")
-    fetch_draft.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(fetch_draft)
     fetch_draft.add_argument("--full", action="store_true", help="Print the full draft JSON instead of a compact summary.")
 
     list_articles = subparsers.add_parser("list-articles", help="List Substack publication articles by state.")
-    list_articles.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(list_articles)
     list_articles.add_argument(
         "--state",
         default="published,draft,scheduled",
@@ -946,9 +1324,30 @@ def main() -> None:
     list_articles.add_argument("--offset", type=int, default=0, help="Pagination offset for each requested state (default: 0).")
     list_articles.add_argument("--limit", type=int, default=25, help="Pagination limit for each requested state (default: 25).")
     list_articles.add_argument("--full", action="store_true", help="Print the raw JSON grouped by state instead of a compact summary.")
+    list_articles.add_argument(
+        "--include-body-stats",
+        action="store_true",
+        help="Fetch draft details as needed and include body content stats in compact output.",
+    )
+    list_articles.add_argument(
+        "--body-filter",
+        choices=BODY_FILTERS,
+        default="any",
+        help="Filter by draft body content: any, has-content, empty, unknown (default: any).",
+    )
+
+    set_cover = subparsers.add_parser(
+        "set-cover",
+        help="Upload (or accept) a header/cover image and attach it to an existing draft.",
+    )
+    set_cover.add_argument("draft_id", help="Existing draft id.")
+    set_cover.add_argument("image_path", nargs="?", type=Path, help="Local image to upload and set as cover.")
+    add_publication_url_arg(set_cover)
+    set_cover.add_argument("--cover-url", help="Already-uploaded cover image URL (instead of a local path).")
+    set_cover.add_argument("--content-type", help="Override image content type.")
 
     create_draft = subparsers.add_parser("create-draft", help="Create an unpublished Substack article draft.")
-    create_draft.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(create_draft)
     create_draft.add_argument("--publication-id", required=True, type=int, help="Publication id.")
     create_draft.add_argument("--byline-user-id", required=True, type=int, help="Substack user id for draft_bylines.")
     create_draft.add_argument("--draft-type", default="newsletter", help="Draft type (default: newsletter).")
@@ -979,10 +1378,14 @@ def main() -> None:
     create_draft.add_argument("--image-content-type", default="image/png", help="Image content type (default: image/png).")
     create_draft.add_argument("--image-alt", help="Image alt text.")
     create_draft.add_argument("--image-title", help="Image title.")
+    create_draft.add_argument(
+        "--cover-image",
+        help="Header/cover image: local file path (uploaded) or https URL.",
+    )
 
     save_draft = subparsers.add_parser("save-draft", help="Save an existing Substack article draft.")
     save_draft.add_argument("draft_id", help="Existing draft id, e.g. 204727458.")
-    save_draft.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(save_draft)
     save_draft.add_argument("--title", help="Draft title.")
     save_draft.add_argument("--subtitle", help="Draft subtitle.")
     save_draft.add_argument("--byline-user-id", type=int, help="Optional Substack user id for draft_bylines.")
@@ -1011,20 +1414,24 @@ def main() -> None:
     save_draft.add_argument("--image-content-type", default="image/png", help="Image content type (default: image/png).")
     save_draft.add_argument("--image-alt", help="Image alt text.")
     save_draft.add_argument("--image-title", help="Image title.")
+    save_draft.add_argument(
+        "--cover-image",
+        help="Header/cover image: local file path (uploaded) or https URL.",
+    )
 
     prepublish = subparsers.add_parser("prepublish", help="Run Substack's prepublish check for a draft.")
     prepublish.add_argument("draft_id", help="Existing draft id.")
-    prepublish.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(prepublish)
     prepublish.add_argument("--publish-date", help="Optional scheduled publish timestamp, e.g. 2026-07-06T13:30:00.000Z.")
 
     publish = subparsers.add_parser("publish-draft", help="Publish an existing Substack article draft.")
     publish.add_argument("draft_id", help="Existing draft id.")
-    publish.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(publish)
     publish.add_argument("--send-email", action="store_true", help="Email subscribers when publishing.")
 
     schedule = subparsers.add_parser("schedule-draft", help="Schedule an existing Substack article draft.")
     schedule.add_argument("draft_id", help="Existing draft id.")
-    schedule.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(schedule)
     schedule.add_argument(
         "--trigger-at",
         required=True,
@@ -1042,11 +1449,19 @@ def main() -> None:
 
     unschedule = subparsers.add_parser("unschedule-draft", help="Unschedule an existing Substack article draft.")
     unschedule.add_argument("draft_id", help="Existing draft id.")
-    unschedule.add_argument("--publication-url", required=True, help="Publication origin, e.g. https://example.substack.com.")
+    add_publication_url_arg(unschedule)
 
     args = parser.parse_args()
 
     try:
+        config: dict[str, Any] | None = None
+
+        def resolve_publication_url(value: str | None) -> str:
+            nonlocal config
+            if config is None:
+                config = _load_config(args.config)
+            return _publication_url(value, config)
+
         client = Substack(
             token=args.token,
             token_path=args.token_path,
@@ -1055,15 +1470,17 @@ def main() -> None:
         if args.command == "post-note":
             result = client.post_note(args.text, args.reply_minimum_role)
         elif args.command == "upload-image":
+            publication_url = resolve_publication_url(args.publication_url)
             result = client.upload_image(
-                publication_url=args.publication_url,
+                publication_url=publication_url,
                 image_path=args.image_path,
                 draft_id=args.draft_id,
                 content_type=args.content_type,
             )
         elif args.command == "append-image":
+            publication_url = resolve_publication_url(args.publication_url)
             result = client.append_image_to_draft(
-                publication_url=args.publication_url,
+                publication_url=publication_url,
                 draft_id=args.draft_id,
                 image_path=args.image_path,
                 byline_user_id=args.byline_user_id,
@@ -1072,67 +1489,99 @@ def main() -> None:
                 title=args.title,
             )
         elif args.command == "fetch-draft":
-            result = client.fetch_draft(args.publication_url, args.draft_id)
+            publication_url = resolve_publication_url(args.publication_url)
+            result = client.fetch_draft(publication_url, args.draft_id)
             if args.full:
                 print(json.dumps(result, indent=2, ensure_ascii=False))
                 return
             _print_draft_summary(result)
             return
         elif args.command == "list-articles":
+            publication_url = resolve_publication_url(args.publication_url)
             result = client.list_articles(
-                publication_url=args.publication_url,
+                publication_url=publication_url,
                 states=_parse_article_states(args.state),
                 offset=args.offset,
                 limit=args.limit,
             )
+            if args.include_body_stats or args.body_filter != "any":
+                _attach_body_stats(client, publication_url, result)
+            _filter_by_body_content(result, args.body_filter)
             if args.full:
                 print(json.dumps(result, indent=2, ensure_ascii=False))
                 return
             _print_article_list_summary(result)
             return
         elif args.command == "create-draft":
+            publication_url = resolve_publication_url(args.publication_url)
+            args.publication_url = publication_url
             metadata = _front_matter_from_args(args)
             title = args.title if args.title is not None else _metadata_text(metadata, "title")
             subtitle = args.subtitle if args.subtitle is not None else (_metadata_text(metadata, "subtitle", "excerpt", "description") or "")
             result = client.create_draft(
-                publication_url=args.publication_url,
+                publication_url=publication_url,
                 publication_id=args.publication_id,
                 byline_user_id=args.byline_user_id,
                 draft_type=args.draft_type,
             )
-            if title or args.body_json or args.body_file or args.block or args.image_url:
+            cover_arg = args.cover_image or _cover_from_metadata(metadata, args.body_file)
+            if title or args.body_json or args.body_file or args.block or args.image_url or cover_arg:
+                args.draft_id = result.get("draft_id") or result.get("id")
+                args._client = client
+                cover = _resolve_cover(client, publication_url, args.draft_id, cover_arg)
                 result = client.save_draft(
-                    publication_url=args.publication_url,
-                    draft_id=result["id"],
+                    publication_url=publication_url,
+                    draft_id=args.draft_id,
                     title=title or "",
                     subtitle=subtitle,
                     body=_body_from_args(args),
                     byline_user_id=args.byline_user_id,
                     should_send_email=args.send_email,
                     last_updated_at=result.get("draft_updated_at"),
+                    cover_image=cover,
                 )
         elif args.command == "save-draft":
+            publication_url = resolve_publication_url(args.publication_url)
+            args.publication_url = publication_url
             metadata = _front_matter_from_args(args)
             title = args.title if args.title is not None else _metadata_text(metadata, "title")
             if title is None:
                 raise ValueError("Missing title. Provide --title or front matter title in --body-file.")
             subtitle = args.subtitle if args.subtitle is not None else (_metadata_text(metadata, "subtitle", "excerpt", "description") or "")
+            args._client = client
+            cover_arg = args.cover_image or _cover_from_metadata(metadata, getattr(args, "body_file", None))
+            cover = _resolve_cover(client, publication_url, args.draft_id, cover_arg)
             result = client.save_draft(
-                publication_url=args.publication_url,
+                publication_url=publication_url,
                 draft_id=args.draft_id,
                 title=title,
                 subtitle=subtitle,
                 body=_body_from_args(args),
                 byline_user_id=args.byline_user_id,
                 should_send_email=args.send_email,
+                cover_image=cover,
+            )
+        elif args.command == "set-cover":
+            publication_url = resolve_publication_url(args.publication_url)
+            if bool(args.image_path) == bool(args.cover_url):
+                raise SystemExit("set-cover: provide exactly one of IMAGE_PATH or --cover-url")
+            result = client.set_cover_image(
+                publication_url,
+                args.draft_id,
+                image_path=args.image_path,
+                cover_url=args.cover_url,
+                content_type=args.content_type,
             )
         elif args.command == "prepublish":
-            result = client.prepublish_draft(args.publication_url, args.draft_id, publish_date=args.publish_date)
+            publication_url = resolve_publication_url(args.publication_url)
+            result = client.prepublish_draft(publication_url, args.draft_id, publish_date=args.publish_date)
         elif args.command == "publish-draft":
-            result = client.publish_draft(args.publication_url, args.draft_id, send=args.send_email)
+            publication_url = resolve_publication_url(args.publication_url)
+            result = client.publish_draft(publication_url, args.draft_id, send=args.send_email)
         elif args.command == "schedule-draft":
+            publication_url = resolve_publication_url(args.publication_url)
             result = client.schedule_draft(
-                publication_url=args.publication_url,
+                publication_url=publication_url,
                 draft_id=args.draft_id,
                 trigger_at=args.trigger_at,
                 post_audience=args.post_audience,
@@ -1142,7 +1591,8 @@ def main() -> None:
                 byline_user_id=args.byline_user_id,
             )
         elif args.command == "unschedule-draft":
-            result = client.unschedule_draft(args.publication_url, args.draft_id)
+            publication_url = resolve_publication_url(args.publication_url)
+            result = client.unschedule_draft(publication_url, args.draft_id)
         else:
             parser.error(f"Unsupported command: {args.command}")
     except requests.HTTPError as exc:
