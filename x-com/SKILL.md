@@ -9,6 +9,11 @@ Before using this skill, read `AGENTS.md` in this directory if it exists. That f
 
 Use `scripts/x_com.py` for X.com Articles work: draft creation, title/content/cover updates, publishing, unpublishing, and listing drafts or published articles. The client is reverse-engineered from the X web composer's GraphQL traffic.
 
+**Run all commands from this skill's directory** (`cd` here first). The default
+credential files (`.secrets/*.txt`) and the `scripts/x_com.py` path in every
+example below resolve relative to the current directory. Pass body/cover files
+as absolute paths or paths relative to this directory.
+
 ## Requirements
 
 Use a Python environment with `requests` installed:
@@ -34,7 +39,8 @@ session cookies** copied from a logged-in x.com session.
 | `twid` | **only `list`** | Holds your numeric user id (`u=<id>`); not needed for create/publish/unpublish |
 
 So **create, publish, and unpublish need only `auth_token` + `ct0`.** The `list`
-command additionally needs your user id, which comes from `twid` (or `--user-id`).
+command additionally needs your user id, read automatically from
+`.secrets/twid` when present (or pass `--user-id`).
 
 The public web bearer token (shipped in x.com's JS bundle — not a secret) is
 sent automatically; the user does not provide it.
@@ -53,8 +59,10 @@ If the user has not provided credentials, walk them through these steps:
 
 ### How to provide the cookies
 
-The client checks these sources in priority order; the last one means an agent
-can drop two files and run with no flags:
+The client resolves credentials in this priority order: CLI flags > `--cookie`
+string > `--cookie-path` file > environment variables > the two default
+`.secrets/*.txt` files. The default-files path means an agent can drop two
+files once and then run every command with no flags:
 
 ```bash
 # 1. Discrete files (what this repo uses by default)
@@ -86,22 +94,24 @@ Cookies expire — refresh them from the browser if calls start returning HTTP
 
 ### User id for listing
 
-`list` needs the numeric user id. It is auto-parsed from a `twid` cookie (`u=<id>`)
-when a cookie string/file is provided; otherwise pass `--user-id <user-id>`. The
-discrete `.secrets/auth_token.txt` + `.secrets/ct0.txt` files do **not** carry a
-user id, so `list` with only those two files requires `--user-id`. It is not
-needed for create/publish/unpublish.
+`list` needs the numeric user id. It is auto-parsed from a `twid` cookie
+(`u=<id>`) in a cookie string/file, or from a `.secrets/twid` file (holding
+`u=<id>` or the bare id) sitting next to the auth-token file. Pass
+`--user-id <user-id>` to override. If none of those exist, `list` errors and
+everything else still works — the id is not needed for create/publish/unpublish.
 
 ## Quick Start
 
 ```bash
-# Create a draft from a markdown file (create shell + title + content)
+# Create a draft from a markdown file (create shell + title + content).
+# --title is optional when the file has front matter with a title:, and a
+# leading "# <same title>" heading in the body is dropped automatically.
 python3 scripts/x_com.py draft --title "My Article" --body-file article.md
 
 # Create and publish in one step
 python3 scripts/x_com.py draft --title "My Article" --body-file article.md --publish
 
-# List drafts / published articles
+# List drafts / published articles (user id auto-read from .secrets/twid)
 python3 scripts/x_com.py list --status draft
 python3 scripts/x_com.py list --status published
 
@@ -130,12 +140,15 @@ python3 scripts/x_com.py draft --title "Title" --body-file article.md [options]
 
 | Option | Description |
 |---|---|
-| `--title <str>` | Article title (required) |
+| `--title <str>` | Article title (optional when the body file has a front-matter `title:`) |
 | `--body-file <path>` | Markdown file for the body |
 | `--cover-image <path>` | Local image file to upload and set as the cover |
 | `--cover-media-id <id>` | Already-uploaded media id to set as the cover |
+| `--no-inline-images` | Skip uploading/inserting `![...](path)` images |
 | `--publish` | Publish immediately after creating |
 | `--visibility <str>` | Publish visibility, default `Public` |
+
+When neither `--cover-image` nor `--cover-media-id` is given, a front-matter `image:` entry in the body file is auto-resolved relative to that file and used as the cover.
 
 Prints the new numeric `article_id` and the editor URL `https://x.com/compose/articles/edit/<article_id>`.
 
@@ -144,7 +157,7 @@ Python API:
 ```python
 from x_com import XCom
 
-client = XCom(cookie_path=".secrets/x_com_cookie.txt")
+client = XCom()  # auth from .secrets/*.txt (cwd = skill dir); or XCom(cookie_path=...)
 result = client.create_article(title="Hello", body_file="article.md")
 print(result["article_id"])
 client.publish_article(result["article_id"])
@@ -159,7 +172,8 @@ Build or edit a draft step by step:
 python3 scripts/x_com.py create
 
 python3 scripts/x_com.py set-title <article_id> --title "New Title"
-python3 scripts/x_com.py set-content <article_id> --body-file article.md
+python3 scripts/x_com.py set-content <article_id> --body-file article.md   # links + inline images handled
+python3 scripts/x_com.py set-content <article_id> --body-file article.md --no-inline-images
 
 # Cover: upload a local image, or reuse an already-uploaded media id
 python3 scripts/x_com.py set-cover <article_id> --image cover.jpg
@@ -195,9 +209,36 @@ client.set_content(shell["article_id"], body_file="article.md")
 | `1. text` | `ordered-list-item` |
 | ` ``` ` fenced block | `atomic` block + `MARKDOWN` entity (holds the whole fenced snippet verbatim) |
 | `---` / `***` / `___` | `atomic` block + `DIVIDER` entity |
+| `![alt](path)` | `atomic` block + `MEDIA` entity (image auto-uploaded first; path resolved relative to the body file) |
+| `\| col \| col \|` pipe table | `atomic` block + `MARKDOWN` entity (verbatim table text; same mechanism as code fences) |
+| `*caption text*` line under an image | becomes that image's `data.caption` (renders as X's figure caption), *not* a paragraph |
 | anything else | `unstyled` paragraph |
 
-Inline `**bold**` and `*italic*` become Draft.js inline style ranges — X accepts only `Bold` and `Italic`. Backticks and `_` are left literal (X has no inline-code style, and this avoids mangling URLs and snake_case). Blank lines separate blocks. Use `\` to escape a literal marker.
+Inline `**bold**` and `*italic*` become Draft.js inline style ranges — X accepts only `Bold` and `Italic`. Backticks and `_` are left literal (X has no inline-code style, and this avoids mangling URLs and snake_case). `![alt](url)` (remote image) also matches the image rule — it is uploaded from disk only when the path is a real local file; otherwise the block is skipped with a warning. Blank lines separate blocks. Use `\` to escape a literal marker.
+
+**Image captions:** the established authoring convention (same as the user's
+other projects) is a pure-italic line `*like this*` on the line right after an
+image, at most one blank line separating them:
+
+```markdown
+![ignored alt text](img.png)
+
+*Fig 1. The caption that X actually renders under the image*
+```
+
+The converter attaches it to the preceding MEDIA entity as `data.caption` —
+exactly what the web composer's caption field sends (verified from HAR).
+Note the **alt text in `![...]` is discarded** (X articles have no alt field);
+captions come ONLY from the following italic line. Two blank lines, or any
+other block in between, ends the caption window (the line then stays a normal
+paragraph). A line containing other markers (e.g. `*see [a](b)*` or bold `**`)
+is never treated as a caption.
+
+**Hyperlinked images** (`[![alt](img.png)](url)`): X's composer serializes
+these as a plain MEDIA entity and *drops the link* (verified from HAR) — the
+converter mirrors that: the image is inserted, the wrapping URL is discarded.
+
+Inline `[label](url)` becomes a **LINK entity** — `{"data": {"url": ...}, "type": "LINK", "mutability": "Mutable"}` in `entity_map` plus an `entity_range` over the label text (this is the exact shape the browser composer sends, captured from HAR; per-article duplicate urls share one entity). A leading `# Title` line identical to the front-matter `title:` is dropped automatically — X renders the title above the body, and keeping the H1 duplicates it.
 
 **Schema constraints (learned the hard way — X returns an opaque `GRAPHQL_VALIDATION_FAILED` or `OperationalError: Internal: Unspecified` when violated):**
 
@@ -205,8 +246,31 @@ Inline `**bold**` and `*italic*` become Draft.js inline style ranges — X accep
 - There is no `code-block` type; fenced code must be a `MARKDOWN` atomic entity.
 - Only `Bold`/`Italic` inline styles; `Code` (and others) are rejected.
 - Block `text` must be single-line; embed no `\n` (each line is its own block).
+- LINK entities: `data` carries **only** `url`, and `mutability` is `Mutable`. A `link_name` field is rejected (validation error on `data.link_name`).
+- Pipe tables are NOT a native block type: they ride a MARKDOWN atomic entity
+  whose `data.markdown` is the verbatim `| a | b |` text (composer-captured).
+- MEDIA `data.caption` is plain text (inline styles stripped); it renders as
+  the caption under the figure.
+- MEDIA (inline image) entities: shape is `{"type": "MEDIA", "mutability": "Immutable", "data": {"entity_key": "<uuid4>", "media_items": [{"local_media_id": <int>, "media_category": "DraftTweetImage", "media_id": "<id>"}]}}` on an `atomic` block. Upload the file first via the `tweet_image` media category. **Do not hand-build
+`data.mediaId`/`data.url` variants** — `mediaId` is rejected by validation and
+the url-only shape, while accepted, is not what the composer produces.
+- The WRITE payload uses snake_case (`entity_map` on the content_state, `entity_ranges` per block), but a READ via `ArticleEntitiesSlice` returns the stored state with **`entityMap`** (camelCase) at the content_state level. When verifying a draft, walk the response for the article's `content_state` dict and read `blocks` + `entityMap`.
+- `media_entities` at the article level lists every media id referenced by the body ( handy to confirm inline uploads landed).
 
 To supply a raw `content_state` directly, call `client.set_content(article_id, content_state=...)` from Python.
+
+### Verifying a draft after writing it
+
+`list` output does not include the body. To confirm links/images/captions
+landed server-side, fetch `ArticleEntitiesSlice` and walk the response for the
+article's `content_state`, then inspect `blocks` + `entityMap` (note the
+camelCase on reads) and the article-level `media_entities` (every media id
+referenced by the body). Example one-liner pattern:
+
+```python
+body = client._get("ArticleEntitiesSlice", {"userId": uid, "lifecycle": "Draft", "count": 5})
+# walk dicts for {"rest_id": <article_id>} -> res["content_state"]["entityMap"]
+```
 
 ## Publishing
 
@@ -284,32 +348,27 @@ next_cursor = page["next_cursor"]
 
 ## Smoke Test
 
-Because the captured HAR is sanitized (cookies and bearer stripped), the client
-has only been verified offline. Run this once with live cookies to confirm the
-query IDs and auth still work end to end. It creates a throwaway draft, edits it,
-publishes, unpublishes, and lists — exercising every operation.
-
-Save a fresh browser Cookie header string (including `auth_token`, `ct0`, and
-`twid`) to `.secrets/x_com_cookie.txt` first, then:
+Run this when in doubt (e.g. after X ships a new web bundle) to confirm the
+query IDs and auth still work end to end. It creates a throwaway draft,
+publishes, unpublishes, and lists — exercising every operation. Auth comes
+from the usual sources; with `.secrets/*.txt` in place no flags are needed.
+Skip it unless you must — publish/unpublish churn can trip the account-level
+rate/automation limits (see Publishing).
 
 ```bash
-COOKIE=.secrets/x_com_cookie.txt
-
 # 1. Create + edit a draft from markdown
 printf '# Smoke Test\n\nHello from the x-com skill.\n' > /tmp/x_smoke.md
-python3 scripts/x_com.py draft --title "Smoke Test" --body-file /tmp/x_smoke.md \
-  --cookie-path "$COOKIE"
+python3 scripts/x_com.py draft --title "Smoke Test" --body-file /tmp/x_smoke.md
 # -> note the printed article_id
 
 # 2. It should appear under drafts
-python3 scripts/x_com.py list --status draft --cookie-path "$COOKIE"
+python3 scripts/x_com.py list --status draft
 
-# 3. Publish it, confirm it moves to published
-python3 scripts/x_com.py publish <article_id> --cookie-path "$COOKIE"
-python3 scripts/x_com.py list --status published --cookie-path "$COOKIE"
-
-# 4. Unpublish it back to draft (cleanup)
-python3 scripts/x_com.py unpublish <article_id> --cookie-path "$COOKIE"
+# 3. Publish it, confirm it moves to published, then UNPUBLISH and DELETE it
+python3 scripts/x_com.py publish <article_id>
+python3 scripts/x_com.py list --status published
+python3 scripts/x_com.py unpublish <article_id>
+python3 scripts/x_com.py delete <article_id>
 ```
 
 What to check:
@@ -322,8 +381,8 @@ What to check:
 - If publish/unpublish specifically fail while create/list succeed, the
   `x-client-transaction-id` header may now be required (see Pitfalls).
 
-`.secrets/` is gitignored, so the cookie file stays local. Delete the test
-article from the X composer afterward if you don't want it lingering as a draft.
+`.secrets/` is gitignored, so credentials stay local. The smoke draft ends
+deleted; if any step fails midway, clean it up with `delete`.
 
 ## API Reference
 
@@ -351,4 +410,4 @@ The article id used in requests is the numeric `rest_id`, also derivable by base
 - **`ct0` must match the cookie.** The `x-csrf-token` header must equal the `ct0` cookie value; the script keeps them in sync automatically.
 - **Cover uploads** go to `upload.x.com` (a different host from the GraphQL API) and send the whole image as a single APPEND segment — fine for cover-sized JP/PNG images, but very large files would need real multi-segment chunking, which is not implemented.
 - **`x-client-transaction-id`.** The web app sends a per-request `x-client-transaction-id` header that this client omits. GraphQL article endpoints have accepted requests without it, but if X tightens verification and calls start failing, that header may need to be generated.
-- **Listing needs a user id.** Include the `twid` cookie or pass `--user-id`; create/publish/unpublish do not need it.
+- **Listing needs a user id.** Auto-read from a `twid` cookie or `.secrets/twid`; otherwise pass `--user-id`. create/publish/unpublish do not need it.

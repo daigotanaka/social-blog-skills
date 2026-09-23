@@ -49,10 +49,11 @@ import base64
 import string
 import random
 import hashlib
+import uuid
 import argparse
 import mimetypes
 from urllib.parse import quote
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -78,14 +79,14 @@ _BEARER = (
 # these when it ships a new bundle; if a call starts returning HTTP 404 or a
 # GRAPHQL_VALIDATION_FAILED error, recapture a HAR and refresh the ids below.
 _Q = {
-    "ArticleEntityDraftCreate": "rSvnWw6CAJo4F9xVieZhLA",
-    "ArticleEntityUpdateTitle": "PplP1XRcflB3VYMQJdd_hw",
-    "ArticleEntityUpdateContent": "CPOMQigUs99fzPmNe_1-EA",
-    "ArticleEntityUpdateCoverMedia": "AbzX20PDk6TTzqmN67hiPQ",
+    "ArticleEntityDraftCreate": "_rbmb_NKLqKVBr5X_MSoMQ",
+    "ArticleEntityUpdateTitle": "brHFCBTXXg8WOqc7BnXfAw",
+    "ArticleEntityUpdateContent": "x4Pz2ifYkOD6uSvzxOIUig",
+    "ArticleEntityUpdateCoverMedia": "TRcLHwCpNAkBVcxy4FLH1A",
     "ArticleEntityPublish": "xkPT5esHwPTNtJfp-1xKaQ",
     "ArticleEntityUnpublish": "4M8Wv2IADEw61KFMrXqOSQ",
     "ArticleEntityDelete": "e4lWqB6m2TA8Fn_j9L9xEA",
-    "ArticleEntitiesSlice": "dDmkonrnmZCNvGAddHYSHQ",
+    "ArticleEntitiesSlice": "oLK4ja2Rj6q21t4ktw8pYA",
 }
 
 
@@ -105,6 +106,10 @@ def _parse_front_matter_value(value: str) -> Any:
             return json.loads(value)
         except json.JSONDecodeError:
             pass
+    # A quoted scalar is a string even if it contains commas; only bare
+    # comma-separated values are lists (YAML-lite front matter).
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
     if "," in value:
         return [_strip_wrapping_quotes(part) for part in value.split(",") if part.strip()]
     return _strip_wrapping_quotes(value)
@@ -256,13 +261,26 @@ def _block_key() -> str:
 # (Italic) are emitted; X's article schema rejects any other inline style enum.
 # X articles have no inline-code style, so backticks are kept literal, and ``_``
 # is left literal too (to avoid mangling URLs and snake_case words).
-def _parse_inline(text: str) -> Tuple[str, List[Dict[str, int]]]:
-    """Strip inline markdown markers and return (clean_text, style_ranges).
+_LINK_RE = re.compile(r'\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)')
+_IMAGE_RE = re.compile(r'!\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)')
+# The established convention (other projects) for an image caption: a pure
+# italic line ``*this is the caption*`` just under an image -> MEDIA data.caption.
+_CAPTION_RE = re.compile(r"\*([^*\[\]()]+)\*")
+_TABLE_ROW_RE = re.compile(r"^\|.*\|\s*$")
 
-    Returns a list of ``{"offset", "length", "style"}`` dicts matching the
-    ``inline_style_ranges`` Draft.js format.
+
+def _parse_inline(
+    text: str,
+    link_sink: Optional[Callable[[str], int]] = None,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Strip inline markdown -> (clean_text, inline_style_ranges, entity_ranges).
+
+    ``link_sink(url)`` returns the entity key to attach to a link's label
+    range. When it is None, link syntax is kept verbatim (also used when
+    re-parsing a label, so nested links are never turned into entities twice).
     """
     ranges: List[Dict[str, Any]] = []
+    eranges: List[Dict[str, Any]] = []
     out: List[str] = []
     open_at: Dict[str, int] = {}  # style -> offset where it opened
     i, n = 0, len(text)
@@ -282,37 +300,57 @@ def _parse_inline(text: str) -> Tuple[str, List[Dict[str, int]]]:
             i += 2
             continue
         ch = text[i]
-        if ch == "*":
-            toggle("Italic")
-            i += 1
-            continue
         if ch == "\\" and i + 1 < n:  # escaped marker -> literal next char
             out.append(text[i + 1])
             i += 2
             continue
+        if ch == "*":
+            toggle("Italic")
+            i += 1
+            continue
+        if ch == "[" and link_sink is not None and (i == 0 or text[i - 1] != "!"):
+            m = _LINK_RE.match(text, i)
+            if m:
+                start = len(out)
+                label_text, label_styles, _ = _parse_inline(m.group(1))
+                out.append(label_text)
+                for s in label_styles:
+                    ranges.append({"offset": start + s["offset"],
+                                   "length": s["length"], "style": s["style"]})
+                eranges.append({"key": link_sink(m.group(2)),
+                                "offset": start, "length": len(label_text)})
+                i = m.end()
+                continue
         out.append(ch)
         i += 1
 
-    # Any marker left unclosed (e.g. an Italic '*' opened but never closed) is
-    # not real formatting; drop it so we never emit a zero/partial range that
-    # spills to the block end.
+    # Any marker left unclosed is not real formatting; toggle() only records a
+    # range on close, so we never emit a partial range spilling to block end.
     ranges.sort(key=lambda r: r["offset"])
-    return "".join(out), ranges
+    return "".join(out), ranges, eranges
 
 
-def _text_block(block_type: str, raw_text: str) -> Dict[str, Any]:
-    clean, styles = _parse_inline(raw_text)
+def _text_block(
+    block_type: str,
+    raw_text: str,
+    link_sink: Optional[Callable[[str], int]] = None,
+) -> Dict[str, Any]:
+    clean, styles, eranges = _parse_inline(raw_text, link_sink)
     return {
         "data": {},
         "text": clean,
         "key": _block_key(),
         "type": block_type,
-        "entity_ranges": [],
+        "entity_ranges": eranges,
         "inline_style_ranges": styles,
     }
 
 
-def markdown_to_content_state(markdown_text: str) -> Dict[str, Any]:
+def markdown_to_content_state(
+    markdown_text: str,
+    media_uploader: Optional[Callable[[str], str]] = None,
+    base_dir: Optional[str] = None,
+) -> Dict[str, Any]:
     """Convert markdown into an X Articles ``content_state`` object.
 
     Supported block constructs (mappings reflect what X's schema accepts):
@@ -325,25 +363,54 @@ def markdown_to_content_state(markdown_text: str) -> Dict[str, Any]:
                               fenced snippet verbatim -- there is no code-block
                               Draft.js type)
         --- / *** / ___       divider (atomic block + DIVIDER entity)
+        ![alt](path)          atomic block + MEDIA entity; image paths resolve
+                              against ``base_dir`` and upload via
+                              ``media_uploader`` (path -> media_id). Skipped
+                              with a warning when no uploader is given.
         anything else         unstyled paragraph
 
-    Inline ``**bold**`` and ``*italic*`` become Draft.js inline style ranges;
-    X's schema accepts only Bold and Italic, so backticks and ``_`` are left
-    literal. Blank lines separate blocks.
+    Inline ``**bold**`` / ``*italic*`` become Draft.js inline style ranges and
+    ``[label](url)`` becomes a LINK entity. A leading ``# Title`` identical to
+    the front-matter title is dropped (X renders the title separately from the
+    body). Blank lines separate blocks.
     """
-    markdown_text, _metadata = parse_markdown_front_matter(markdown_text)
+    markdown_text, metadata = parse_markdown_front_matter(markdown_text)
+    fm_title = (_metadata_text(metadata, "title") or "").strip()
+    if fm_title:
+        markdown_text = re.sub(
+            r"\A\s*#[ \t]*" + re.escape(fm_title) + r"[ \t]*\r?\n",
+            "", markdown_text, count=1)
     blocks: List[Dict[str, Any]] = []
     entity_map: List[Dict[str, Any]] = []
+    link_keys: Dict[str, int] = {}
+    media_seq = 0
+    pending_media_key: Optional[int] = None  # MEDIA entity awaiting a caption line
+    pending_gap = 0                          # blank lines seen since pending armed
+    in_table = False
+    table_lines: List[str] = []
     lines = markdown_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
     in_code = False
     code_lines: List[str] = []
     code_lang = ""
 
-    def add_atomic(entity_value: Dict[str, Any]) -> None:
-        """Append an atomic block backed by a new entity (divider, code, ...)."""
-        entity_key = len(entity_map)
-        entity_map.append({"key": str(entity_key), "value": entity_value})
+    def add_entity(value: Dict[str, Any]) -> int:
+        key = len(entity_map)
+        entity_map.append({"key": str(key), "value": value})
+        return key
+
+    def add_link(url: str) -> int:
+        # X reuses one LINK entity per url; deduping keeps entity_map small
+        # for articles that cite the same source many times.
+        if url in link_keys:
+            return link_keys[url]
+        key = add_entity({"data": {"url": url}, "type": "LINK", "mutability": "Mutable"})
+        link_keys[url] = key
+        return key
+
+    def add_atomic(entity_value: Dict[str, Any]) -> int:
+        """Append an atomic block backed by a new entity (divider, code, media)."""
+        entity_key = add_entity(entity_value)
         blocks.append({
             "data": {},
             "text": " ",
@@ -352,6 +419,7 @@ def markdown_to_content_state(markdown_text: str) -> Dict[str, Any]:
             "entity_ranges": [{"key": entity_key, "offset": 0, "length": 1}],
             "inline_style_ranges": [],
         })
+        return entity_key
 
     def flush_code() -> None:
         # X renders a fenced code block as an atomic block backed by a MARKDOWN
@@ -360,11 +428,56 @@ def markdown_to_content_state(markdown_text: str) -> Dict[str, Any]:
         fenced = "```" + code_lang + "\n" + "\n".join(code_lines) + "\n```"
         add_atomic({"data": {"markdown": fenced}, "type": "MARKDOWN", "mutability": "Mutable"})
 
+    def flush_table() -> None:
+        # Pipe tables ride the same MARKDOWN entity mechanism: the composer
+        # sends the verbatim markdown table text (header/separator/rows).
+        if table_lines:
+            add_atomic({"data": {"markdown": "\n".join(table_lines)},
+                        "type": "MARKDOWN", "mutability": "Mutable"})
+            table_lines.clear()
+
     def add_divider() -> None:
         add_atomic({"data": {}, "type": "DIVIDER", "mutability": "Immutable"})
 
+    def add_media(raw_path: str) -> None:
+        # Composer-captured MEDIA shape: Immutable entity carrying a fresh
+        # uuid4 entity_key plus media_items referencing an uploaded
+        # (tweet_image) media id under the DraftTweetImage category. An
+        # optional data.caption renders under the image in the X composer.
+        nonlocal media_seq, pending_media_key, pending_gap
+        if media_uploader is None:
+            print(f"warning: inline image '{raw_path}' skipped (upload disabled)",
+                  file=sys.stderr)
+            return
+        path = raw_path if os.path.isabs(raw_path) else os.path.normpath(
+            os.path.join(base_dir or os.getcwd(), raw_path))
+        try:
+            media_id = media_uploader(path)
+        except Exception as exc:
+            print(f"warning: inline image '{raw_path}' upload failed: {exc}",
+                  file=sys.stderr)
+            return
+        media_seq += 1
+        pending_gap = 0
+        pending_media_key = add_atomic({
+            "type": "MEDIA",
+            "mutability": "Immutable",
+            "data": {
+                "entity_key": str(uuid.uuid4()),
+                "media_items": [{
+                    "local_media_id": media_seq,
+                    "media_category": "DraftTweetImage",
+                    "media_id": str(media_id),
+                }],
+            },
+        })
+
     for line in lines:
         stripped = line.strip()
+
+        if in_table and not stripped.startswith("|"):
+            flush_table()
+            in_table = False
 
         if stripped.startswith("```"):
             if in_code:
@@ -382,10 +495,49 @@ def markdown_to_content_state(markdown_text: str) -> Dict[str, Any]:
             continue
 
         if not stripped:
+            if pending_media_key is not None:
+                pending_gap += 1
+                if pending_gap > 1:  # paragraph break ends the caption window
+                    pending_media_key = None
             continue
 
+        # A pure-italic line directly under an image (one blank line allowed)
+        # becomes that image's caption (MEDIA entity data.caption), not a paragraph.
+        if pending_media_key is not None:
+            cm = _CAPTION_RE.fullmatch(stripped)
+            if cm:
+                caption_text, _styles, _ers = _parse_inline(stripped)
+                entity_map[pending_media_key]["value"]["data"]["caption"] = caption_text
+                pending_media_key = None
+                continue
+
+        # Pipe table rows accumulate into one MARKDOWN entity.
+        if _TABLE_ROW_RE.match(stripped):
+            if not in_table:
+                in_table = True
+                table_lines.clear()
+            table_lines.append(stripped)
+            pending_media_key = None
+            continue
+        if in_table:
+            flush_table()
+            in_table = False
+
+        # Peel image refs off the line; each becomes its own atomic MEDIA
+        # block after whatever text remains on the line.
+        img_paths = [mm.group(2) for mm in _IMAGE_RE.finditer(stripped)]
+        if img_paths:
+            stripped = _IMAGE_RE.sub("", stripped).strip()
+            if not stripped:
+                for p in img_paths:
+                    add_media(p)
+                continue
+
         if re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", stripped):
+            pending_media_key = None
             add_divider()
+            for p in img_paths:
+                add_media(p)
             continue
 
         m = re.match(r"(#{1,6})\s+(.*)", stripped)
@@ -393,28 +545,30 @@ def markdown_to_content_state(markdown_text: str) -> Dict[str, Any]:
             # X articles only support two heading levels. # -> H1, everything
             # deeper (## and beyond) collapses to H2.
             block_type = "header-one" if len(m.group(1)) == 1 else "header-two"
-            blocks.append(_text_block(block_type, m.group(2)))
-            continue
-
-        m = re.match(r">\s?(.*)", stripped)
-        if m:
-            blocks.append(_text_block("blockquote", m.group(1)))
-            continue
-
-        m = re.match(r"(?:[-*+])\s+(.*)", stripped)
-        if m:
-            blocks.append(_text_block("unordered-list-item", m.group(1)))
-            continue
-
-        m = re.match(r"\d+\.\s+(.*)", stripped)
-        if m:
-            blocks.append(_text_block("ordered-list-item", m.group(1)))
-            continue
-
-        blocks.append(_text_block("unstyled", stripped))
+            inner = m.group(2)
+        else:
+            m = re.match(r">\s?(.*)", stripped)
+            if m:
+                block_type, inner = "blockquote", m.group(1)
+            else:
+                m = re.match(r"(?:[-*+])\s+(.*)", stripped)
+                if m:
+                    block_type, inner = "unordered-list-item", m.group(1)
+                else:
+                    m = re.match(r"\d+\.\s+(.*)", stripped)
+                    if m:
+                        block_type, inner = "ordered-list-item", m.group(1)
+                    else:
+                        block_type, inner = "unstyled", stripped
+        pending_media_key = None
+        blocks.append(_text_block(block_type, inner, add_link))
+        for p in img_paths:
+            add_media(p)
 
     if in_code:  # unterminated fence
         flush_code()
+    if in_table:
+        flush_table()
 
     return {"blocks": blocks, "entity_map": entity_map}
 
@@ -550,11 +704,15 @@ class XCom:
         content_state: Optional[Dict[str, Any]] = None,
         body_file: Optional[str] = None,
         markdown: Optional[str] = None,
+        upload_images: bool = True,
     ) -> Dict[str, Any]:
         """Set an article draft's body.
 
         Provide one of ``content_state`` (raw Draft.js), ``markdown`` (a
-        markdown string), or ``body_file`` (a path to a markdown file).
+        markdown string), or ``body_file`` (a path to a markdown file). Inline
+        ``![alt](path)`` images are uploaded and inserted as MEDIA entities
+        (paths resolved against the body file's directory) unless
+        ``upload_images`` is False.
         """
         if content_state is None:
             if markdown is None and body_file is not None:
@@ -562,7 +720,18 @@ class XCom:
                     markdown = f.read()
             if markdown is None:
                 raise ValueError("set_content needs content_state, markdown, or body_file.")
-            content_state = markdown_to_content_state(markdown)
+            cache: Dict[str, str] = {}
+
+            def _upload(path: str) -> str:
+                if path not in cache:
+                    cache[path] = self.upload_media(path)
+                return cache[path]
+
+            content_state = markdown_to_content_state(
+                markdown,
+                media_uploader=_upload if upload_images else None,
+                base_dir=os.path.dirname(os.path.abspath(body_file)) if body_file else None,
+            )
         self._post("ArticleEntityUpdateContent", {
             "content_state": content_state,
             "article_entity": str(article_id),
@@ -676,12 +845,16 @@ class XCom:
         cover_image: Optional[str] = None,
         publish: bool = False,
         visibility: str = "Public",
+        upload_images: bool = True,
     ) -> Dict[str, Any]:
         """Full flow: create draft -> set title -> set content -> (cover) -> (publish).
 
         ``cover_image`` uploads a local image file; ``cover_media_id`` uses an
-        already-uploaded media id. Returns a dict including the new ``article_id``.
+        already-uploaded media id. With neither given, the body file's
+        front-matter ``image:`` is auto-resolved (relative to the body file)
+        and used as the cover. Returns a dict including the new ``article_id``.
         """
+        metadata: Dict[str, Any] = {}
         if markdown is None and body_file is not None:
             with open(body_file, "r", encoding="utf-8") as f:
                 markdown = f.read()
@@ -690,15 +863,23 @@ class XCom:
             title = title or _metadata_text(metadata, "title")
         if not title:
             raise ValueError("title is required. Provide --title or front matter title in --body-file.")
-        content_state = markdown_to_content_state(markdown) if markdown is not None else None
+
+        if not cover_image and not cover_media_id and body_file:
+            fm_img = _metadata_text(metadata, "image")
+            if fm_img:
+                cand = os.path.normpath(os.path.join(
+                    os.path.dirname(os.path.abspath(body_file)), fm_img))
+                if os.path.isfile(cand):
+                    cover_image = cand
 
         shell = self.create_draft_shell()
         article_id = shell["article_id"]
 
         if title:
             self.set_title(article_id, title)
-        if content_state is not None:
-            self.set_content(article_id, content_state=content_state)
+        if markdown is not None:
+            self.set_content(article_id, markdown=markdown, body_file=body_file,
+                             upload_images=upload_images)
         if cover_image:
             self.set_cover_image(article_id, cover_image)
         elif cover_media_id:
@@ -780,6 +961,18 @@ def _add_auth_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--user-id", help="Numeric user id (for listing; auto-read from twid if omitted)")
 
 
+def _default_twid_user_id() -> Optional[str]:
+    """Read the numeric user id from .secrets/twid (holds `u=<id>` or a raw id)."""
+    try:
+        with open(os.path.join(os.path.dirname(_DEFAULT_AUTH_TOKEN_PATH), "twid")) as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    from urllib.parse import unquote
+    m = re.search(r"u(?:=|%3D)(\d+)", unquote(raw))
+    return m.group(1) if m else (raw if raw.isdigit() else None)
+
+
 def _client(args: argparse.Namespace) -> XCom:
     return XCom(
         auth_token=getattr(args, "auth_token", None),
@@ -814,6 +1007,8 @@ def main() -> int:
     d_p.add_argument("--body-file", help="Path to markdown body file")
     d_p.add_argument("--cover-image", help="Local image file to upload and set as cover")
     d_p.add_argument("--cover-media-id", help="Already-uploaded media id to set as cover")
+    d_p.add_argument("--no-inline-images", action="store_true",
+                     help="Skip uploading/inserting inline ![](path) images")
     d_p.add_argument("--publish", action="store_true", help="Publish immediately after creating")
     d_p.add_argument("--visibility", default="Public", help="Publish visibility (default: Public)")
     _add_auth_args(d_p)
@@ -832,6 +1027,8 @@ def main() -> int:
     sc_p = sub.add_parser("set-content", help="Set an article draft's body from markdown")
     sc_p.add_argument("article_id", help="Numeric article entity id")
     sc_p.add_argument("--body-file", required=True, help="Path to markdown body file")
+    sc_p.add_argument("--no-inline-images", action="store_true",
+                      help="Skip uploading/inserting inline ![](path) images")
     _add_auth_args(sc_p)
 
     # --- set-cover ---
@@ -869,6 +1066,8 @@ def main() -> int:
     _add_auth_args(l_p)
 
     args = ap.parse_args()
+    if getattr(args, "user_id", None) is None:
+        args.user_id = _default_twid_user_id()
     if not args.command:
         ap.print_help()
         return 1
@@ -879,11 +1078,12 @@ def main() -> int:
         if args.command == "draft":
             result = client.create_article(
                 title=args.title,
-                markdown=_read_markdown(getattr(args, "body_file", None)),
+                body_file=getattr(args, "body_file", None),
                 cover_image=getattr(args, "cover_image", None),
                 cover_media_id=getattr(args, "cover_media_id", None),
                 publish=getattr(args, "publish", False),
                 visibility=getattr(args, "visibility", "Public"),
+                upload_images=not getattr(args, "no_inline_images", False),
             )
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
@@ -901,7 +1101,9 @@ def main() -> int:
             return 0
 
         if args.command == "set-content":
-            result = client.set_content(args.article_id, markdown=_read_markdown(args.body_file))
+            _read_markdown(args.body_file)  # validate path early
+            result = client.set_content(args.article_id, body_file=args.body_file,
+                                        upload_images=not args.no_inline_images)
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
 
