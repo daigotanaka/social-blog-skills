@@ -11,14 +11,40 @@ The main workflow is:
 
 1. Provide LinkedIn browser session cookies.
 2. Create or update a newsletter article draft from markdown.
-3. Optionally upload and attach a 16:9 header image.
-4. Schedule the article by scheduling an accompanying LinkedIn post.
+   Header image (from front matter `image:`) and inline body images are
+   uploaded and attached automatically.
+3. Schedule the article by scheduling an accompanying LinkedIn post.
+4. Verify with one command: `check <article-id>`.
 
-Run commands from the `linkedin` skill directory unless paths below are adjusted:
+Preferred invocation (avoids path-policy traps): run from the WORKSPACE ROOT
+with workspace-relative paths, not by `cd`-ing into the skill (under valet,
+`../../` traversal is denied), passing cred-dir explicitly:
 
 ```bash
-cd /path/to/social-blog-skills/linkedin
+python3 skills/social-blog-skills/linkedin/scripts/linkedin.py \
+  --cred-dir skills/social-blog-skills/linkedin/.secrets \
+  --timeout 60 <command> ...
 ```
+
+Older sections below say "run from the linkedin skill dir"; that also works in
+a plain shell. Under valet also raise the transport timeout (e.g.
+`valet sh --timeout 300`): image uploads + polling exceed the 60s default and
+fail silently mid-run.
+
+## One-time setup (already done)
+
+`config.json` in this directory stores `author_profile_urn` and
+`content_series_urn`, so those flags can be omitted everywhere:
+
+```json
+{"author_profile_urn": "urn:li:fsd_profile:...",
+ "content_series_urn": "urn:li:fsd_contentSeries:..."}
+```
+
+Env vars `LINKEDIN_AUTHOR_PROFILE_URN` / `LINKEDIN_CONTENT_SERIES_URN` and
+explicit flags override it. To find the values fresh, grep the HAR captures
+with `grep -roah "fsd_profile.\{0,60\}" .secrets/` (grepping the full
+`urn:li:fsd_profile:` prefix comes back redacted).
 
 ## Authentication
 
@@ -132,15 +158,60 @@ The first `# Heading` becomes the article title unless `--title` is provided. Th
 
 Links are converted to their visible text in the LinkedIn block payload. The generated HTML is also sent as `contentHtml`.
 
+## Inline Body Images
+
+Standalone markdown image lines `![alt](path)` are uploaded and embedded as
+real LinkedIn article image blocks in body order on `create-article`,
+`save-article`, `schedule-newsletter`, and `create-newsletter`. Relative paths
+resolve against the markdown file's directory (override with `--images-dir`).
+Disable with `--inline-images off` (image lines are dropped, as in the old
+behavior). Uploads use `mediaUploadType: PUBLISHING_INLINE_IMAGE`; blocks use
+the schema captured from published drafts (`ImageBlock` with
+`vectorImage.rootUrl`
+`https://media.licdn.com/dms/image/v2/<id>/article-inline_image-shrink_`), and
+`contentHtml` renders `<figure><img data-media-urn=...><figcaption>alt</figcaption></figure>`.
+Verified end-to-end 2026-09-22 on the harness-engineering draft (4 inline PNGs
+plus a separate `--header-image` cover).
+
+Verified end-to-end 2026-09-22 on the harness-engineering draft (4 inline PNGs
+plus a separate `--header-image` cover).
+
+## Rich Inline Formatting
+
+`create-article`/`save-article` preserve markdown formatting as LinkedIn text
+attributes (`attributesV2` spans captured from published drafts): `[text](url)`
+becomes a clickable `hyperlink` span, `**bold**` → `style: BOLD`, `*italic*` →
+`style: ITALIC`, bullet/numbered lists become `listItemStyle` spans
+(SOLID_BULLET / NUMBERED), and `---` becomes a `dividerBlock`. Inline `code`
+renders as plain text (no block-level schema evidence found). When bold nests
+inside a link (`[**text**](url)`) the link span wins. Re-saving a body with
+`save-article --body-file` re-uploads inline images (new asset URNs); omit
+`--header-image` to keep the existing cover. Verified 2026-09-22: all 7 source
+links landed as hyperlink attrs + `<a href>` in the live draft.
+
+
 ## Create a Draft From Markdown
 
 Use `create-article` for a new draft only. This does not schedule or publish.
+Inline body images upload automatically (`--inline-images off` to skip), and
+the header comes from `--header-image` or, when omitted, from front matter
+`image:`. URNs fall back to config.json, so the minimal form is:
 
 ```bash
 python3 scripts/linkedin.py --cred-dir .secrets create-article \
-  --author-profile-urn urn:li:fsd_profile:<profile-id> \
-  --content-series-urn urn:li:fsd_contentSeries:<newsletter-id> \
   --body-file /path/to/article.md
+```
+
+A full one-shot publish is three commands:
+
+```bash
+# 1. draft (header + inline images auto-attached; note the printed article id)
+python3 ... create-article --body-file path/to/article.md
+# 2. accompanying post + schedule
+python3 ... schedule-post <article-id> \
+  --post-text-file tmp/post.txt --scheduled-at "2026-09-24T06:30:00-07:00"
+# 3. verify everything in one call
+python3 ... check <article-id>
 ```
 
 The output includes:
@@ -206,13 +277,28 @@ LinkedIn's editor displays newsletter header images in a 16:9 slot. Good target 
 1600 x 900 also safe
 ```
 
-Attach or replace a header image:
+Attach or replace a header image explicitly (only needed when front matter
+has no `image:` line, or to change it later):
 
 ```bash
 python3 scripts/linkedin.py --cred-dir .secrets save-article <article-id> \
   --header-image .secrets/header.jpg \
   --header-image-content-type image/jpeg
 ```
+
+WARNING: `save-article --body-file` RE-UPLOADS all inline images (new asset
+URNs each time). Editing body text of a SCHEDULED article still requires the
+delete-share -> save -> reschedule dance. To change ONLY the accompanying post
+text or time, use `update-scheduled-post` (one command, no body re-save):
+
+```bash
+python3 scripts/linkedin.py --cred-dir .secrets update-scheduled-post <article-id> \
+  --post-text-file tmp/post.txt [--scheduled-at "ISO-8601"]
+```
+
+It finds the article's scheduled share via the scheduled-post listing, deletes
+it, and reschedules with the new text, keeping the existing time when
+`--scheduled-at` is omitted.
 
 This performs two operations:
 
@@ -332,6 +418,16 @@ python3 scripts/linkedin.py --cred-dir .secrets create-newsletter \
 This creates a draft, saves body/title, attaches the header image, then schedules the accompanying post.
 
 ## Other Commands
+
+Draft health check (the verification step; no manual JSON grepping needed):
+
+```bash
+python3 scripts/linkedin.py --cred-dir .secrets check <article-id>
+```
+
+Returns state, scheduled time + share URNs, contentBlocks count, imageBlocks
+count, hyperlink URLs, bold/italic span counts, media asset URNs, and a
+markdownDebris flag.
 
 Fetch sharebox metadata:
 

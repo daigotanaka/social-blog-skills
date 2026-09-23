@@ -41,6 +41,7 @@ import mimetypes
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -57,6 +58,7 @@ SHAREBOX_QUERY_ID = "voyagerContentcreationDashSharebox.6065bbd24f145384527c50bf
 CREATE_SHARE_QUERY_ID = "voyagerContentcreationDashShares.80089eb2e82a2dfa23cb621fb09eb7bf"
 DELETE_SHARE_QUERY_ID = "voyagerContentcreationDashShares.b7155044c276d51764fc9981037204b3"
 DEFAULT_COOKIE_PATH = Path(".secrets/linkedin-cookie.txt")
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 _BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -92,6 +94,8 @@ def _parse_front_matter_value(value: str) -> Any:
             return json.loads(value)
         except json.JSONDecodeError:
             pass
+    if value[0] in ('"', "'"):
+        return _strip_wrapping_quotes(value)
     if "," in value:
         return [_strip_wrapping_quotes(part) for part in value.split(",") if part.strip()]
     return _strip_wrapping_quotes(value)
@@ -345,6 +349,77 @@ def list_block(items: list[str], ordered: bool = False) -> dict[str, Any]:
     return text_block("\n".join(f"{prefix}{item}" for item in items), "PARAGRAPH")
 
 
+_FORMAT_TOKEN = re.compile(
+    r"`([^`\n]+)`"
+    r"|\*\*([^*\n]+)\*\*"
+    r"|\*([^*\n]+)\*"
+    r"|\[([^\]]+)\]\(([^)\s]+)\)"
+)
+
+_TEXT_ATTR_TYPE = "com.linkedin.voyager.dash.common.text.TextAttribute"
+
+
+def _span(start: int, length: int, detail: dict) -> dict:
+    return {
+        "start": start,
+        "length": length,
+        "detailDataUnion": detail,
+        "$type": _TEXT_ATTR_TYPE,
+    }
+
+
+def render_inline(markdown_text: str) -> tuple[str, list[dict]]:
+    """Inline markdown -> (plain_text, text_attributes) with absolute offsets."""
+    if not markdown_text:
+        return "", []
+    buf = ""
+    marks: list[dict] = []
+    idx = 0
+    for match in _FORMAT_TOKEN.finditer(markdown_text):
+        if match.start() > idx:
+            buf += markdown_text[idx:match.start()]
+        idx = match.end()
+        code, bold, ital, link_label, link_href = match.groups()
+        if code is not None:
+            buf += code  # inline code renders as plain text (no schema evidence)
+        elif bold is not None:
+            text, sub_marks = render_inline(bold)
+            start = len(buf)
+            buf += text
+            marks.extend({**a, "start": a["start"] + start} for a in sub_marks)
+            marks.append(_span(start, len(text), {"style": "BOLD"}))
+        elif ital is not None:
+            text, sub_marks = render_inline(ital)
+            start = len(buf)
+            buf += text
+            marks.extend({**a, "start": a["start"] + start} for a in sub_marks)
+            marks.append(_span(start, len(text), {"style": "ITALIC"}))
+        else:
+            text, sub_marks = render_inline(link_label)
+            start = len(buf)
+            buf += text
+            # keep only nested links from the label; style spans would overlap
+            # the hyperlink span, and the link wins in the flat renderer
+            marks.extend(
+                {**a, "start": a["start"] + start}
+                for a in sub_marks
+                if a["detailDataUnion"].get("hyperlink")
+            )
+            marks.append(_span(start, len(text), {"hyperlink": link_href}))
+    buf += markdown_text[idx:]
+    marks.sort(key=lambda a: (a["start"], -a["length"]))
+    return buf, marks
+
+
+def text_block_rich(markdown_text: str, block_type: str = "PARAGRAPH") -> dict[str, Any]:
+    text, marks = render_inline(markdown_text)
+    block = text_block(text, block_type)
+    if marks:
+        block["textBlock"]["content"]["attributesV2"] = marks
+    return block
+
+
+
 def _inline_text(markdown_text: str) -> str:
     text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", markdown_text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
@@ -386,37 +461,79 @@ def content_blocks_to_html(content: list[dict[str, Any]] | None) -> str:
     if not content:
         return ""
 
+    def _detail_html(src: str, spans: list[dict[str, Any]]) -> str:
+        ordered = sorted(spans, key=lambda a: int(a.get("start", 0)))
+        chunks: list[str] = []
+        cursor = 0
+        for attr in ordered:
+            s, ln = int(attr.get("start", 0)), int(attr.get("length", 0))
+            if s < cursor:
+                continue
+            detail = (attr.get("detailDataUnion") or {})
+            if detail.get("hyperlink"):
+                open_tag, close_tag = f'<a href="{escape(detail["hyperlink"], quote=True)}" target="_blank">', "</a>"
+            elif detail.get("style") == "BOLD":
+                open_tag, close_tag = "<strong>", "</strong>"
+            elif detail.get("style") == "ITALIC":
+                open_tag, close_tag = "<em>", "</em>"
+            else:
+                continue
+            chunks.append(escape(src[cursor:s]))
+            chunks.append(open_tag + escape(src[s:s + ln]) + close_tag)
+            cursor = s + ln
+        chunks.append(escape(src[cursor:]))
+        return "".join(chunks)
+
     parts: list[str] = []
     for block in content:
+        if block.get("dividerBlock"):
+            parts.append("<hr>")
+            continue
+        image_value = block.get("imageBlock")
+        if image_value:
+            vector = (((image_value.get("content") or {}).get("attributes") or [{}])[0]
+                      .get("detailDataUnion") or {}).get("vectorImage") or {}
+            alt = ((image_value.get("caption") or {}).get("text")) or ""
+            parts.append(figure_html_from_asset(vector.get("digitalmediaAsset", ""), alt))
+            continue
         text_block_value = block.get("textBlock") or {}
         block_type = text_block_value.get("type") or "PARAGRAPH"
         text = (text_block_value.get("content") or {}).get("text") or ""
-        html_text = escape(text).replace("\n", "<br>")
-        attrs = (text_block_value.get("content") or {}).get("attributesV2") or []
+        attrs = [a for a in ((text_block_value.get("content") or {}).get("attributesV2") or [])]
+        list_attrs = [a for a in attrs if (a.get("detailDataUnion") or {}).get("listItemStyle")]
+        inner_attrs = [a for a in attrs if a not in list_attrs]
 
-        if attrs and all((attr.get("detailDataUnion") or {}).get("listItemStyle") for attr in attrs):
-            ordered = any((attr.get("detailDataUnion") or {}).get("listItemStyle", {}).get("type") == "ORDERED" for attr in attrs)
+        if list_attrs:
+            ordered = all((a["detailDataUnion"]["listItemStyle"].get("type") == "NUMBERED") for a in list_attrs)
             tag = "ol" if ordered else "ul"
-            items: list[str] = []
-            for attr in attrs:
-                start = int(attr.get("start") or 0)
-                length = int(attr.get("length") or 0)
-                items.append(f"<li><p>{escape(text[start:start + length])}</p></li>")
-            parts.append(f"<{tag}>{''.join(items)}</{tag}>")
-        elif block_type == "HEADING_1":
-            parts.append(f"<h2>{html_text}</h2>")
-        elif block_type == "HEADING_2":
-            parts.append(f"<h3>{html_text}</h3>")
-        elif block_type == "QUOTE":
-            parts.append(f"<blockquote><p>{html_text}</p></blockquote>")
+            items_html: list[str] = []
+            bounds = [int(a["start"]) for a in list_attrs] + [len(text)]
+            for i, a in enumerate(list_attrs):
+                body_start = int(a["start"]) + int(a["length"])
+                body_end = bounds[i + 1]
+                rel = []
+                for b in inner_attrs:
+                    bs, bl = int(b.get("start", 0)), int(b.get("length", 0))
+                    if bs >= body_start and bs + bl <= body_end:
+                        rel.append({**b, "start": bs - body_start})
+                items_html.append(f"<li><p>{_detail_html(text[body_start:body_end].rstrip(), rel)}</p></li>")
+            parts.append(f"<{tag}>{''.join(items_html)}</{tag}>")
         elif block_type == "CODE_BLOCK":
             parts.append(f"<pre>{escape(text)}</pre>")
         else:
-            parts.append(f"<p>{html_text}</p>")
+            body = _detail_html(text, inner_attrs)
+            if block_type == "HEADING_1":
+                parts.append(f"<h2>{body}</h2>")
+            elif block_type == "HEADING_2":
+                parts.append(f"<h3>{body}</h3>")
+            elif block_type == "QUOTE":
+                parts.append(f"<blockquote><p>{body.replace(chr(10), '<br>')}</p></blockquote>")
+            else:
+                parts.append(f"<p>{body.replace(chr(10), '<br>')}</p>")
     return "".join(parts)
 
 
-def markdown_to_article(markdown_text: str) -> dict[str, Any]:
+def markdown_to_article(markdown_text: str, images_dir: str | Path | None = None) -> dict[str, Any]:
     markdown_text, metadata = parse_markdown_front_matter(markdown_text)
     title: str | None = _metadata_text(metadata, "title")
     content: list[dict[str, Any]] = []
@@ -428,6 +545,7 @@ def markdown_to_article(markdown_text: str) -> dict[str, Any]:
     quote: list[str] = []
     code_lines: list[str] = []
     in_code = False
+    images: list[dict[str, Any]] = []
 
     def flush_paragraph() -> None:
         nonlocal paragraph
@@ -435,7 +553,7 @@ def markdown_to_article(markdown_text: str) -> dict[str, Any]:
             return
         md_text = " ".join(part.strip() for part in paragraph).strip()
         if md_text:
-            content.append(text_block(_inline_text(md_text), "PARAGRAPH"))
+            content.append(text_block_rich(md_text, "PARAGRAPH"))
             html_parts.append(f"<p>{_inline_html(md_text)}</p>")
         paragraph = []
 
@@ -443,7 +561,20 @@ def markdown_to_article(markdown_text: str) -> dict[str, Any]:
         nonlocal list_items, list_html_items, list_ordered
         if not list_items:
             return
-        content.append(list_block(list_items, ordered=list_ordered))
+        prefix = "1. " if list_ordered else "- "
+        style_type = "NUMBERED" if list_ordered else "SOLID_BULLET"
+        rendered = [render_inline(item) for item in list_items]
+        attrs: list[dict[str, Any]] = []
+        texts: list[str] = []
+        pos = 0
+        for i, (item_text, item_marks) in enumerate(rendered):
+            attrs.append(_span(pos, len(prefix), {"listItemStyle": {"type": style_type, "index": i}}))
+            attrs.extend({**a, "start": a["start"] + pos + len(prefix)} for a in item_marks)
+            texts.append(item_text)
+            pos += len(prefix) + len(item_text) + 1
+        block = text_block("\n".join(f"{prefix}{t}" for t in texts), "PARAGRAPH")
+        block["textBlock"]["content"]["attributesV2"] = attrs
+        content.append(block)
         html_parts.append(content_blocks_to_html([content[-1]]))
         list_items = []
         list_html_items = []
@@ -455,7 +586,7 @@ def markdown_to_article(markdown_text: str) -> dict[str, Any]:
             return
         md_text = " ".join(part.strip() for part in quote).strip()
         if md_text:
-            content.append(text_block(_inline_text(md_text), "QUOTE"))
+            content.append(text_block_rich(md_text, "QUOTE"))
             html_parts.append(f"<blockquote><p>{_inline_html(md_text)}</p></blockquote>")
         quote = []
 
@@ -502,8 +633,10 @@ def markdown_to_article(markdown_text: str) -> dict[str, Any]:
             if level == 1 and title is None:
                 title = text
                 continue
+            if level == 1 and text == title:
+                continue
             block_type = "HEADING_1" if level <= 1 else "HEADING_2"
-            content.append(text_block(text, block_type))
+            content.append(text_block_rich(heading.group(2), block_type))
             html_tag = "h2" if block_type == "HEADING_1" else "h3"
             html_parts.append(f"<{html_tag}>{html}</{html_tag}>")
             continue
@@ -518,7 +651,7 @@ def markdown_to_article(markdown_text: str) -> dict[str, Any]:
             if list_items and list_ordered != is_ordered:
                 flush_list()
             list_ordered = is_ordered
-            list_items.append(_inline_text(item_md))
+            list_items.append(item_md.strip())
             list_html_items.append(f"<li><p>{_inline_html(item_md)}</p></li>")
             continue
 
@@ -526,6 +659,26 @@ def markdown_to_article(markdown_text: str) -> dict[str, Any]:
             flush_paragraph()
             flush_list()
             quote.append(stripped.lstrip(">").strip())
+            continue
+
+        if re.fullmatch(r"[-*_]{3,}", stripped):
+            flush_paragraph()
+            flush_list()
+            flush_quote()
+            content.append({"dividerBlock": {"dividerBlockType": "DEFAULT", "$type": "com.linkedin.voyager.dash.publishing.DividerBlock"}})
+            continue
+
+        image_line = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)$", stripped)
+        if image_line:
+            flush_paragraph()
+            flush_list()
+            flush_quote()
+            images.append({
+                "alt": image_line.group(1),
+                "src": image_line.group(2).strip(),
+                "uploaded": None,
+            })
+            content.append({"imagePlaceholder": len(images) - 1})
             continue
 
         paragraph.append(stripped)
@@ -541,6 +694,8 @@ def markdown_to_article(markdown_text: str) -> dict[str, Any]:
         "metadata": metadata,
         "content": content,
         "content_html": content_blocks_to_html(content),
+        "images": images,
+        "images_dir": Path(images_dir) if images_dir else None,
     }
 
 
@@ -548,7 +703,99 @@ def load_markdown_arg(markdown: str | None, path: Path | None) -> dict[str, Any]
     if markdown is None and path is None:
         return None
     text = markdown if markdown is not None else path.read_text(encoding="utf-8")
-    return markdown_to_article(text)
+    article = markdown_to_article(text)
+    if path is not None:
+        article["images_dir"] = Path(path).expanduser().resolve().parent
+    return article
+
+
+def resolve_image_path(entry: dict[str, Any], images_dir: Path | None) -> Path:
+    src_path = Path(entry["src"])
+    if src_path.is_absolute():
+        if src_path.exists():
+            return src_path
+        raise FileNotFoundError(f"inline image not found: {src_path}")
+    if images_dir is not None:
+        candidate = (images_dir / src_path).resolve()
+        if candidate.exists():
+            return candidate
+        candidate = (images_dir.parent / src_path).resolve()
+        if candidate.exists():
+            return candidate
+    candidate = src_path.expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+    raise FileNotFoundError(f"inline image not found: {entry['src']} (images_dir={images_dir})")
+
+
+def image_block_from_asset(asset_urn: str, alt: str = "") -> dict[str, Any]:
+    media_id = asset_urn.rsplit(":", 1)[-1]
+    root_url = f"https://media.licdn.com/dms/image/v2/{media_id}/article-inline_image-shrink_"
+    return {
+        "imageBlock": {
+            "caption": {
+                "text": alt,
+                "attributesV2": [],
+                "$type": "com.linkedin.voyager.dash.common.text.TextViewModel",
+            },
+            "alignment": "RESIZE",
+            "content": {
+                "attributes": [
+                    {
+                        "detailDataUnion": {
+                            "vectorImage": {
+                                "digitalmediaAsset": asset_urn,
+                                "artifacts": [],
+                                "rootUrl": root_url,
+                                "$type": "com.linkedin.common.VectorImage",
+                            }
+                        },
+                        "$type": "com.linkedin.voyager.dash.common.image.ImageAttribute",
+                    }
+                ],
+                "$type": "com.linkedin.voyager.dash.common.image.ImageViewModel",
+            },
+            "$type": "com.linkedin.voyager.dash.publishing.ImageBlock",
+        }
+    }
+
+
+def figure_html_from_asset(asset_urn: str, alt: str = "") -> str:
+    media_id = asset_urn.rsplit(":", 1)[-1]
+    src = f"https://media.licdn.com/dms/image/v2/{media_id}/article-inline_image-shrink_800_450/"
+    caption = f"<figcaption>{escape(alt)}</figcaption>" if alt else ""
+    return f'<figure><img data-media-urn="{asset_urn}" src="{src}">{caption}</figure>'
+
+
+def resolve_inline_images(
+    client: "LinkedIn",
+    article: dict[str, Any] | None,
+    *,
+    images_dir: str | Path | None = None,
+    enabled: bool = True,
+) -> dict[str, Any] | None:
+    """Upload markdown-referenced images and swap placeholder blocks for real
+    LinkedIn imageBlocks. Mutates and returns the same article dict."""
+    if not article or not article.get("images") or article.get("_images_resolved"):
+        return article
+    article["_images_resolved"] = True
+    if not enabled:
+        article["content"] = [b for b in article["content"] if "imagePlaceholder" not in b]
+        article["content_html"] = content_blocks_to_html(article["content"])
+        return article
+    base_dir = Path(images_dir) if images_dir else article.get("images_dir")
+    for block in article["content"]:
+        idx = block.get("imagePlaceholder")
+        if idx is None:
+            continue
+        entry = article["images"][idx]
+        path = resolve_image_path(entry, base_dir)
+        meta = client.upload_media(path, "PUBLISHING_INLINE_IMAGE")
+        entry["uploaded"] = {"urn": meta["urn"], "path": str(path), "status": meta.get("_upload_status")}
+        block.clear()
+        block.update(image_block_from_asset(meta["urn"], entry["alt"]))
+    article["content_html"] = content_blocks_to_html(article["content"])
+    return article
 
 
 def load_json_file(path: Path | None) -> Any:
@@ -678,6 +925,63 @@ class LinkedIn:
 
         result = dict(metadata)
         result["_upload_status"] = upload_response.status_code
+        return result
+
+    def upload_media(
+        self,
+        image_path: str | Path,
+        upload_type: str,
+        referer: str | None = None,
+        content_type: str | None = None,
+    ) -> dict[str, Any]:
+        image_path = Path(image_path)
+        content_type = content_type or mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
+        metadata_response = requests.post(
+            UPLOAD_METADATA_URL,
+            headers=self._headers(referer=referer or f"{LINKEDIN_ORIGIN}/"),
+            json={
+                "mediaUploadType": upload_type,
+                "fileSize": image_path.stat().st_size,
+                "filename": image_path.name,
+            },
+            timeout=self.timeout,
+        )
+        metadata_response.raise_for_status()
+        metadata = metadata_response.json()["data"]["value"]
+        upload_headers = self._headers(
+            accept="*/*",
+            content_type=content_type,
+            referer=referer or f"{LINKEDIN_ORIGIN}/",
+            include_restli=False,
+        )
+        for key, value in (metadata.get("singleUploadHeaders") or {}).items():
+            upload_headers[key] = str(value)
+        upload_response = requests.put(
+            metadata["singleUploadUrl"],
+            headers=upload_headers,
+            data=image_path.read_bytes(),
+            timeout=self.timeout,
+        )
+        upload_response.raise_for_status()
+        result = dict(metadata)
+        result["_upload_status"] = upload_response.status_code
+        polling_url = metadata.get("pollingUrl")
+        if polling_url:
+            for _ in range(20):
+                try:
+                    status_response = requests.get(
+                        polling_url,
+                        headers=self._headers(accept="*/*", content_type=None),
+                        timeout=self.timeout,
+                    )
+                    blob = status_response.text.lower()
+                except Exception:  # noqa: BLE001
+                    break
+                if "failed" in blob:
+                    raise RuntimeError(f"upload processing failed for {image_path.name}")
+                if "succeed" in blob:
+                    break
+                time.sleep(1.5)
         return result
 
     def create_article(
@@ -1079,6 +1383,70 @@ def _extract_post_list_summary(result: dict[str, Any]) -> dict[str, Any]:
     return {"filters": summaries}
 
 
+
+def _find_article_item(obj: Any) -> dict[str, Any] | None:
+    if isinstance(obj, dict):
+        if obj.get("$type") == "com.linkedin.voyager.dash.publishing.FirstPartyArticle" and "content" in obj:
+            return obj
+        for value in obj.values():
+            found = _find_article_item(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_article_item(value)
+            if found:
+                return found
+    return None
+
+
+def _check_summary(client: "LinkedIn", article: str, author_profile_urn: str | None = None) -> dict[str, Any]:
+    import re as _re
+    draft = _find_article_item(client.fetch_latest_draft(article)) or {}
+    shares: list[dict[str, Any]] = []
+    try:
+        profile = author_profile_urn or _config().get("author_profile_urn")
+        if profile:
+            listing = _extract_post_list_summary(
+                client.list_posts(author_profile_urn=profile, filters=["SCHEDULED"])
+            )
+            tail = str(article).rsplit(":", 1)[-1]
+            for group in listing.get("filters", []):
+                for p in group.get("posts", []):
+                    if (p.get("articleUrn") or "").rsplit(":", 1)[-1] == tail:
+                        shares.append({
+                            "scheduledPostUrn": p.get("scheduledPostUrn"),
+                            "scheduledAt": p.get("scheduledAt"),
+                        })
+    except Exception as exc:  # noqa: BLE001
+        shares = [{"error": str(exc)}]
+    blocks = draft.get("content") or []
+    blob = json.dumps(blocks)
+    image_urns = sorted(set(_re.findall(r"urn:li:digitalmediaAsset:[A-Za-z0-9_.-]+", blob)))
+    link_urls = sorted(set(
+        a["detailDataUnion"]["hyperlink"]
+        for b in blocks if b.get("textBlock")
+        for a in (b["textBlock"].get("content") or {}).get("attributesV2") or []
+        if (a.get("detailDataUnion") or {}).get("hyperlink")
+    ))
+    return {
+        "title": draft.get("title"),
+        "state": draft.get("state"),
+        "scheduledAt": draft.get("scheduledAt"),
+        "contentBlocks": len(blocks),
+        "imageBlocks": blob.count('"imageBlock"'),
+        "hyperlinks": len(link_urls),
+        "hyperlinkUrls": link_urls,
+        "boldSpans": blob.count('"BOLD"'),
+        "italicSpans": blob.count('"ITALIC"'),
+        "dividerBlocks": blob.count('"dividerBlock"'),
+        "mediaAssets": image_urns,
+        "markdownDebris": bool(_re.search(r"\*\*|\]\(https?|</?img", blob)),
+        "contentHtmlChars": len(draft.get("contentHtml") or ""),
+        "scheduledShares": shares,
+    }
+
+
 def _print_summary(result: dict[str, Any]) -> None:
     if "singleUploadUrl" in result and "urn" in result:
         summary = {
@@ -1090,8 +1458,12 @@ def _print_summary(result: dict[str, Any]) -> None:
         }
     elif result.get("data", {}).get("linkedInArticleUrn"):
         summary = _extract_article_summary(result)
+        if result.get("_inline_images"):
+            summary["inlineImages"] = result["_inline_images"]
     elif result.get("data", {}).get("data", {}).get("createContentcreationDashShares"):
         summary = _extract_share_summary(result)
+        if result.get("_inline_images"):
+            summary["inlineImages"] = result["_inline_images"]
         if result.get("_uploaded_cover_image"):
             summary["uploadedCoverImage"] = {
                 "urn": result["_uploaded_cover_image"].get("urn"),
@@ -1110,6 +1482,20 @@ def _print_summary(result: dict[str, Any]) -> None:
     else:
         summary = result
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
+def _add_inline_image_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--inline-images",
+        choices=("auto", "off"),
+        default="auto",
+        help="Upload and embed markdown ![alt](path) images in the article body (default: auto).",
+    )
+    parser.add_argument(
+        "--images-dir",
+        type=Path,
+        help="Base directory for relative image paths (default: the markdown file's directory).",
+    )
 
 
 def _add_article_content_args(parser: argparse.ArgumentParser, include_raw_set: bool = True) -> None:
@@ -1218,11 +1604,64 @@ def _raw_set_from_args(args: argparse.Namespace) -> dict[str, Any] | None:
     return raw_set
 
 
+def _config() -> dict[str, Any]:
+    if not hasattr(_config, "_cache"):
+        data: dict[str, Any] = {}
+        if CONFIG_PATH.exists():
+            try:
+                loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except json.JSONDecodeError:
+                pass
+        _config._cache = data  # type: ignore[attr-defined]
+    return _config._cache  # type: ignore[attr-defined]
+
+
 def _author_profile_from_args(args: argparse.Namespace) -> str:
-    value = getattr(args, "author_profile_urn", None) or os.environ.get("LINKEDIN_AUTHOR_PROFILE_URN")
+    value = (
+        getattr(args, "author_profile_urn", None)
+        or os.environ.get("LINKEDIN_AUTHOR_PROFILE_URN")
+        or _config().get("author_profile_urn")
+    )
     if not value:
-        raise ValueError("Missing author profile URN. Provide --author-profile-urn or LINKEDIN_AUTHOR_PROFILE_URN.")
+        raise ValueError(
+            "Missing author profile URN. Provide --author-profile-urn, "
+            "LINKEDIN_AUTHOR_PROFILE_URN, or author_profile_urn in the skill's config.json."
+        )
     return value
+
+
+def _series_from_args(args: argparse.Namespace) -> str:
+    value = (
+        getattr(args, "content_series_urn", None)
+        or os.environ.get("LINKEDIN_CONTENT_SERIES_URN")
+        or _config().get("content_series_urn")
+    )
+    if not value:
+        raise ValueError(
+            "Missing content series URN. Provide --content-series-urn, "
+            "LINKEDIN_CONTENT_SERIES_URN, or content_series_urn in the skill's config.json."
+        )
+    return value
+
+
+def _front_matter_header(args: argparse.Namespace) -> Path | None:
+    """Header image from markdown front matter `image:` when --header-image is absent."""
+    if getattr(args, "header_image", None):
+        return None
+    article = _markdown_article_from_args(args)
+    if not article:
+        return None
+    ref = _metadata_text(article.get("metadata") or {}, "image", "header_image", "cover")
+    if not ref:
+        return None
+    base = article.get("images_dir") or Path(".")
+    for candidate in ((Path(base) / ref).resolve(), (Path(base).parent / ref).resolve(), Path(ref)):
+        if candidate.exists():
+            return candidate
+    print(f"warning: front-matter image not found: {ref}", file=sys.stderr)
+    return None
 
 
 def _article_states_from_filter(value: str) -> list[str]:
@@ -1282,15 +1721,32 @@ def main() -> None:
     upload.add_argument("--content-type", help="Override image content type.")
 
     create = subparsers.add_parser("create-article", help="Create a LinkedIn newsletter article draft.")
-    create.add_argument("--author-profile-urn", required=True, help="Author profile URN, e.g. urn:li:fsd_profile:...")
-    create.add_argument("--content-series-urn", required=True, help="Newsletter/content series id or fsd_contentSeries URN.")
+    create.add_argument("--author-profile-urn", help="Author profile URN (default: config.json/env).")
+    create.add_argument("--content-series-urn", help="Newsletter/content series URN (default: config.json/env).")
     create.add_argument("--title", help="Initial article title. Defaults to the first # heading from markdown.")
+    create.add_argument("--header-image", type=Path, help="Upload and set header image (default: front-matter `image:`).")
+    create.add_argument("--header-image-content-type", help="Override header image content type.")
     create.add_argument("--content-html", help="Optional complete article HTML.")
     create.add_argument("--content-html-file", type=Path, help="Path to optional complete article HTML.")
+    _add_inline_image_args(create)
     _add_article_content_args(create, include_raw_set=False)
 
     fetch = subparsers.add_parser("fetch-latest-draft", help="Fetch the latest draft for an article id/URN.")
     fetch.add_argument("article", help="Article id, fsd_firstPartyArticle URN, or linkedInArticle URN.")
+
+    check = subparsers.add_parser("check", help="One-shot draft health summary: state, images, links, spans, debris, schedule.")
+    check.add_argument("article", help="Article id, fsd_firstPartyArticle URN, or linkedInArticle URN.")
+    check.add_argument("--author-profile-urn", help="Author profile URN for share lookup (default: config.json/env).")
+
+    update_post = subparsers.add_parser(
+        "update-scheduled-post",
+        help="Replace text/time of a scheduled newsletter post: finds and deletes the existing share, then reschedules.",
+    )
+    update_post.add_argument("article", help="Article id or URN (the newsletter article, not the share).")
+    update_post.add_argument("--post-text", help="New accompanying post text.")
+    update_post.add_argument("--post-text-file", type=Path, help="Path to new post text.")
+    update_post.add_argument("--scheduled-at", help="New ISO datetime or epoch ms (default: keep existing time).")
+    update_post.add_argument("--content-series-urn", help="Newsletter/content series URN (default: config.json/env).")
 
     list_article = subparsers.add_parser("list-articles", help="List newsletter articles by state.")
     list_article.add_argument("--author-profile-urn", help="Author profile URN, e.g. urn:li:fsd_profile:...")
@@ -1319,11 +1775,12 @@ def main() -> None:
     save.add_argument("--header-image", type=Path, help="Upload and set a header image.")
     save.add_argument("--header-image-content-type", help="Override header image content type.")
     save.add_argument("--cover-caption", default="", help="Header image caption (default: empty).")
+    _add_inline_image_args(save)
     _add_article_content_args(save)
 
     schedule = subparsers.add_parser("schedule-post", help="Schedule the accompanying post for an article.")
     schedule.add_argument("article", help="Article id, fsd_firstPartyArticle URN, or linkedInArticle URN.")
-    schedule.add_argument("--content-series-urn", required=True, help="Newsletter/content series id or fsd_contentSeries URN.")
+    schedule.add_argument("--content-series-urn", help="Newsletter/content series id or fsd_contentSeries URN (default: config.json/env).")
     schedule.add_argument("--post-text", help="Accompanying post text.")
     schedule.add_argument("--post-text-file", type=Path, help="Path to accompanying post text.")
     schedule.add_argument("--scheduled-at", required=True, help="ISO datetime or epoch milliseconds.")
@@ -1342,7 +1799,7 @@ def main() -> None:
         help="Patch title/subtitle/header image, then schedule the accompanying article post.",
     )
     newsletter.add_argument("article", help="Article id, fsd_firstPartyArticle URN, or linkedInArticle URN.")
-    newsletter.add_argument("--content-series-urn", required=True, help="Newsletter/content series id or fsd_contentSeries URN.")
+    newsletter.add_argument("--content-series-urn", help="Newsletter/content series id or fsd_contentSeries URN (default: config.json/env).")
     newsletter.add_argument("--title", help="Article title.")
     newsletter.add_argument("--subtitle", help="Article subtitle/description.")
     newsletter.add_argument("--content-html", help="Optional complete article HTML to save with --content-json or block args.")
@@ -1353,14 +1810,15 @@ def main() -> None:
     newsletter.add_argument("--post-text", help="Accompanying post text.")
     newsletter.add_argument("--post-text-file", type=Path, help="Path to accompanying post text.")
     newsletter.add_argument("--scheduled-at", required=True, help="ISO datetime or epoch milliseconds.")
+    _add_inline_image_args(newsletter)
     _add_article_content_args(newsletter)
 
     create_newsletter = subparsers.add_parser(
         "create-newsletter",
         help="Create a newsletter article, patch optional title/subtitle/header/body, then schedule the accompanying post.",
     )
-    create_newsletter.add_argument("--author-profile-urn", required=True, help="Author profile URN, e.g. urn:li:fsd_profile:...")
-    create_newsletter.add_argument("--content-series-urn", required=True, help="Newsletter/content series id or fsd_contentSeries URN.")
+    create_newsletter.add_argument("--author-profile-urn", help="Author profile URN (default: config.json/env).")
+    create_newsletter.add_argument("--content-series-urn", help="Newsletter/content series URN (default: config.json/env).")
     create_newsletter.add_argument("--title", help="Article title. Defaults to the first # heading from markdown.")
     create_newsletter.add_argument("--subtitle", help="Article subtitle/description.")
     create_newsletter.add_argument("--content-html", help="Optional complete article HTML to save with --content-json or block args.")
@@ -1371,6 +1829,7 @@ def main() -> None:
     create_newsletter.add_argument("--post-text", help="Accompanying post text.")
     create_newsletter.add_argument("--post-text-file", type=Path, help="Path to accompanying post text.")
     create_newsletter.add_argument("--scheduled-at", required=True, help="ISO datetime or epoch milliseconds.")
+    _add_inline_image_args(create_newsletter)
     _add_article_content_args(create_newsletter)
 
     args = parser.parse_args()
@@ -1383,6 +1842,14 @@ def main() -> None:
             csrf_token=args.csrf_token,
             timeout=args.timeout,
         )
+        def _resolve_inline() -> None:
+            resolve_inline_images(
+                client,
+                _markdown_article_from_args(args),
+                images_dir=getattr(args, "images_dir", None),
+                enabled=getattr(args, "inline_images", "auto") != "off",
+            )
+
         if args.command == "fetch-sharebox":
             result = client.fetch_sharebox(origin=args.origin)
         elif args.command == "upload-cover":
@@ -1392,15 +1859,23 @@ def main() -> None:
                 content_type=args.content_type,
             )
         elif args.command == "create-article":
+            _resolve_inline()
             result = client.create_article(
-                author_profile_urn=args.author_profile_urn,
-                content_series=args.content_series_urn,
+                author_profile_urn=_author_profile_from_args(args),
+                content_series=_series_from_args(args),
                 title=_title_from_args(args, required=True),
                 content=_content_from_args(args),
                 content_html=_content_html_from_args(args),
             )
+            header = args.header_image or _front_matter_header(args)
+            if header:
+                uploaded = client.upload_cover_image(header, article=result["data"]["entityUrn"])
+                client.patch_article(result["data"]["entityUrn"], cover_image_urn=uploaded["urn"])
+                result["_uploaded_cover_image"] = uploaded
         elif args.command == "fetch-latest-draft":
             result = client.fetch_latest_draft(args.article)
+        elif args.command == "check":
+            result = _check_summary(client, args.article, getattr(args, "author_profile_urn", None))
         elif args.command == "list-articles":
             result = client.list_articles(
                 author_profile_urn=_author_profile_from_args(args),
@@ -1414,6 +1889,7 @@ def main() -> None:
                 start=args.start,
             )
         elif args.command == "save-article":
+            _resolve_inline()
             uploaded = None
             cover_urn = None
             if args.header_image:
@@ -1434,24 +1910,55 @@ def main() -> None:
                 raw_set=_raw_set_from_args(args),
             )
             result["_uploaded_cover_image"] = uploaded
+            inline_art = _markdown_article_from_args(args)
+            if inline_art and any(e.get("uploaded") for e in inline_art.get("images", [])):
+                result["_inline_images"] = [e["uploaded"] for e in inline_art["images"] if e.get("uploaded")]
         elif args.command == "schedule-post":
             result = client.schedule_article_share(
                 args.article,
-                content_series=args.content_series_urn,
+                content_series=_series_from_args(args),
                 post_text=load_text_arg(args.post_text, args.post_text_file, "post-text"),
                 scheduled_at=args.scheduled_at,
             )
         elif args.command == "delete-scheduled-share":
             result = client.delete_scheduled_share(args.post)
+        elif args.command == "update-scheduled-post":
+            article_target = first_party_article_urn(args.article)
+            listings = client.list_posts(
+                author_profile_urn=_author_profile_from_args(args),
+                filters=["SCHEDULED"],
+            )
+            summary = _extract_post_list_summary(listings)
+            matches = [
+                p
+                for group in summary.get("filters", [])
+                for p in group.get("posts", [])
+                if p.get("articleUrn") == article_target or (p.get("articleUrn") or "").rsplit(":", 1)[-1] == str(args.article).rsplit(":", 1)[-1]
+            ]
+            if len(matches) > 1:
+                raise ValueError(f"multiple scheduled shares match article {args.article}; delete one explicitly")
+            if matches:
+                client.delete_scheduled_share(matches[0]["scheduledPostUrn"])
+            scheduled_at = args.scheduled_at or (matches[0].get("scheduledAt") if matches else None)
+            if not scheduled_at:
+                raise ValueError("No existing schedule to keep; provide --scheduled-at")
+            result = client.schedule_article_share(
+                args.article,
+                content_series=_series_from_args(args),
+                post_text=load_text_arg(args.post_text, args.post_text_file, "post-text"),
+                scheduled_at=scheduled_at,
+            )
+            result["_replaced_share"] = matches[0]["scheduledPostUrn"] if matches else None
         elif args.command == "schedule-newsletter":
+            _resolve_inline()
             result = client.schedule_newsletter(
                 args.article,
-                content_series=args.content_series_urn,
+                content_series=_series_from_args(args),
                 post_text=load_text_arg(args.post_text, args.post_text_file, "post-text"),
                 scheduled_at=args.scheduled_at,
                 title=_title_from_args(args),
                 subtitle=_subtitle_from_args(args),
-                header_image=args.header_image,
+                header_image=args.header_image or _front_matter_header(args),
                 header_image_content_type=args.header_image_content_type,
                 cover_caption=args.cover_caption,
                 content=_content_from_args(args),
@@ -1460,9 +1967,10 @@ def main() -> None:
             )
         elif args.command == "create-newsletter":
             title = _title_from_args(args, required=True)
+            _resolve_inline()
             created = client.create_article(
-                author_profile_urn=args.author_profile_urn,
-                content_series=args.content_series_urn,
+                author_profile_urn=_author_profile_from_args(args),
+                content_series=_series_from_args(args),
                 title=title,
                 content=_content_from_args(args),
                 content_html=_content_html_from_args(args),
@@ -1470,12 +1978,12 @@ def main() -> None:
             article_urn = created["data"]["entityUrn"]
             result = client.schedule_newsletter(
                 article_urn,
-                content_series=args.content_series_urn,
+                content_series=_series_from_args(args),
                 post_text=load_text_arg(args.post_text, args.post_text_file, "post-text"),
                 scheduled_at=args.scheduled_at,
                 title=title,
                 subtitle=_subtitle_from_args(args),
-                header_image=args.header_image,
+                header_image=args.header_image or _front_matter_header(args),
                 header_image_content_type=args.header_image_content_type,
                 cover_caption=args.cover_caption,
                 content=_content_from_args(args),
@@ -1483,6 +1991,9 @@ def main() -> None:
                 raw_set=_raw_set_from_args(args),
             )
             result["_created_article"] = created
+            inline_art = _markdown_article_from_args(args)
+            if inline_art and any(e.get("uploaded") for e in inline_art.get("images", [])):
+                result["_inline_images"] = [e["uploaded"] for e in inline_art["images"] if e.get("uploaded")]
         else:
             parser.error(f"Unsupported command: {args.command}")
     except requests.HTTPError as exc:
