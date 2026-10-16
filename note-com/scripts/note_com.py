@@ -395,7 +395,7 @@ class NoteCom:
         if md_lib is None:
             raise RuntimeError("The 'markdown' package is required for markdown-to-HTML conversion.")
         markdown_text, _metadata = parse_markdown_front_matter(markdown_text)
-        return cls._with_fresh_note_uuids(md_lib.markdown(markdown_text))
+        return cls._with_fresh_note_uuids(md_lib.markdown(markdown_text, extensions=["fenced_code"]))
 
     # ----------------------------------------------------------------
     # Draft Creation (from save_draft.py)
