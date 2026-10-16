@@ -34,7 +34,11 @@ from urllib.parse import quote
 from typing import Any, Dict, List, Optional
 
 import requests
-import markdown as md_lib
+
+try:
+    import markdown as md_lib
+except ImportError:
+    md_lib = None
 
 
 # ===================================================================
@@ -68,8 +72,15 @@ _NOTE_UUID_TAGS = {
     "ul",
 }
 
+_DEFAULT_TOKEN_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".secrets",
+    "_note_session_v5.txt",
+)
+
+
 def _get_token(token: Optional[str] = None, token_path: Optional[str] = None) -> str:
-    """Resolve a _note_session_v5 cookie from CLI args, a file, or the environment."""
+    """Resolve a _note_session_v5 cookie from CLI args, the environment, or a local file."""
     if token:
         return token
     if token_path and os.path.exists(token_path):
@@ -77,7 +88,12 @@ def _get_token(token: Optional[str] = None, token_path: Optional[str] = None) ->
     env = os.environ.get("NOTE_COM_TOKEN", "")
     if env:
         return env
-    raise ValueError("token required. Pass --token, --token-path, or set NOTE_COM_TOKEN.")
+    if os.path.exists(_DEFAULT_TOKEN_PATH):
+        return open(_DEFAULT_TOKEN_PATH, "r", encoding="utf-8").read().strip()
+    raise ValueError(
+        "token required. Pass --token, --token-path, set NOTE_COM_TOKEN, "
+        f"or create {_DEFAULT_TOKEN_PATH}."
+    )
 
 
 def _browser_headers(token: str, note_key: Optional[str] = None) -> dict:
@@ -195,6 +211,42 @@ def _metadata_tags(metadata: dict[str, Any]) -> Optional[list[str]]:
     if isinstance(tags, list):
         return [str(tag) for tag in tags if str(tag).strip()]
     return None
+
+
+def extract_uuids_from_html(
+    html: str,
+    element: Optional[str] = None,
+    uuid_regex: str = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+) -> List[Dict[str, str]]:
+    """Extract elements whose ``name`` attribute matches a UUID from HTML."""
+    tag_pat = re.compile(r'<([A-Za-z][\w:-]*)(\s+[^>]*)?/?>', re.IGNORECASE | re.DOTALL)
+    name_pat = re.compile(r'\bname\s*=\s*([\'"])(?P<uuid>' + uuid_regex + r')\1', re.IGNORECASE)
+    tag_filter = element.lower() if element else None
+    void_tags = {"br", "hr", "img", "input", "meta", "link"}
+    results: List[Dict[str, str]] = []
+
+    for match in tag_pat.finditer(html):
+        tag_name = match.group(1).lower()
+        if tag_filter is not None and tag_name != tag_filter:
+            continue
+
+        attrs = match.group(2) or ""
+        name_match = name_pat.search(attrs)
+        if name_match is None:
+            continue
+
+        raw_tag = match.group(0).rstrip()
+        if raw_tag.endswith("/>") or tag_name in void_tags:
+            inner = ""
+        else:
+            close_pat = re.compile(r'</\s*' + re.escape(tag_name) + r'\s*>', re.IGNORECASE)
+            close_match = close_pat.search(html, match.end())
+            raw_inner = html[match.end():close_match.start()] if close_match else ""
+            inner = re.sub(r'<[^>]+>', '', raw_inner).strip()
+
+        results.append({"uuid": name_match.group("uuid"), "innerText": inner, "tag": tag_name})
+
+    return results
 
 
 # ===================================================================
@@ -340,6 +392,8 @@ class NoteCom:
 
     @classmethod
     def _markdown_to_note_html(cls, markdown_text: str) -> str:
+        if md_lib is None:
+            raise RuntimeError("The 'markdown' package is required for markdown-to-HTML conversion.")
         markdown_text, _metadata = parse_markdown_front_matter(markdown_text)
         return cls._with_fresh_note_uuids(md_lib.markdown(markdown_text))
 
@@ -683,35 +737,7 @@ class NoteCom:
             A list of dicts in document order:
             ``[{"uuid": "...", "innerText": "...", "tag": "..."}, ...]``
         """
-        uuid_pat = re.compile(uuid_regex, re.IGNORECASE)
-        tag_pat = re.compile(r'<([A-Za-z][\w:-]*)(\s+[^>]*)?/?>', re.IGNORECASE | re.DOTALL)
-        name_pat = re.compile(r'\bname\s*=\s*([\'"])(?P<uuid>' + uuid_regex + r')\1', re.IGNORECASE)
-        tag_filter = element.lower() if element else None
-        void_tags = {"br", "hr", "img", "input", "meta", "link"}
-        results: List[Dict[str, str]] = []
-
-        for match in tag_pat.finditer(html):
-            tag_name = match.group(1).lower()
-            if tag_filter is not None and tag_name != tag_filter:
-                continue
-
-            attrs = match.group(2) or ""
-            name_match = name_pat.search(attrs)
-            if name_match is None:
-                continue
-
-            raw_tag = match.group(0).rstrip()
-            if raw_tag.endswith("/>") or tag_name in void_tags:
-                inner = ""
-            else:
-                close_pat = re.compile(r'</\s*' + re.escape(tag_name) + r'\s*>', re.IGNORECASE)
-                close_match = close_pat.search(html, match.end())
-                raw_inner = html[match.end():close_match.start()] if close_match else ""
-                inner = re.sub(r'<[^>]+>', '', raw_inner).strip()
-
-            results.append({"uuid": name_match.group("uuid"), "innerText": inner, "tag": tag_name})
-
-        return results
+        return extract_uuids_from_html(html, element, uuid_regex)
 
     # ----------------------------------------------------------------
     # Fetch / Publish / Update (from publish.py, update_draft.py)

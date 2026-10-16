@@ -29,7 +29,7 @@ python3 scripts/note_com.py fetch <note_key> --token-path .secrets/note_com_toke
 python3 scripts/note_com.py fetch <note_key> --token "$NOTE_COM_TOKEN"
 ```
 
-If `--token` and `--token-path` are omitted, `scripts/note_com.py` falls back to the `NOTE_COM_TOKEN` environment variable.
+If `--token` and `--token-path` are omitted, `scripts/note_com.py` falls back to `NOTE_COM_TOKEN`, then to `.secrets/_note_session_v5.txt` in this skill directory if that file exists.
 
 ### Auth Error Shape
 
@@ -71,7 +71,7 @@ python3 scripts/note_com.py engage --keyword "python"
 
 ## User Publishing Workflow
 
-See [references/publishing-workflow.md](references/publishing-workflow.md) for the user's content series, cadence, pricing strategy, and growth tactics. The core content loop is:
+The core content loop is:
 
 1. Generate article draft.
 2. Create or update a note.com draft.
@@ -293,8 +293,6 @@ print(draft["status"], draft["body"], draft.get("index"))
 
 ## UUIDs And Paid Separators
 
-See [references/uuid-pattern.md](references/uuid-pattern.md).
-
 note.com editor-created block elements usually have matching `name` and `id` UUIDs:
 
 ```html
@@ -307,6 +305,13 @@ Use the companion helper to inspect draft HTML:
 python3 scripts/note_com.py update <note_key> --save-body /tmp/draft.html
 python3 scripts/extract_uuids.py /tmp/draft.html
 python3 scripts/extract_uuids.py /tmp/draft.html --element hr --json
+```
+
+You can also inspect a live draft directly:
+
+```bash
+python3 scripts/note_com.py extract_uuids <note_key>
+python3 scripts/note_com.py extract_uuids <note_key> --element hr --json
 ```
 
 Prefer `--paid-separator-search` over `--paid-separator-uuid` because updating a body can regenerate UUIDs.
