@@ -836,9 +836,20 @@ class NoteCom:
             payload["pay_body"] = paid_split[1]
             payload["separator"] = paid_separator_uuid
         else:
+            # FREE publish: note.com renders any body element flagged as
+            # separator (or a stale paid separator from a previous paid
+            # publish) as the paid-section cut -- the reader page then shows
+            # only a preview ending at that marker, even with price 0. Strip
+            # stray <hr ...uuid...> paid-cut markers and explicitly clear the
+            # paid state so the whole article is visible without paying.
+            existing_body = re.sub(
+                r'<hr[^>]*\b(?:name|id)="[0-9a-fA-F-]{36}"[^>]*>', "", existing_body)
+            payload["body"] = existing_body
+            payload["body_length"] = len(existing_body)
             payload["free_body"] = existing_body
             payload["pay_body"] = ""
-            payload["separator"] = None
+            payload["separator"] = ""
+            payload["is_paid"] = False
         if publish:
             payload["status"] = "published"
             if price is not None or draft.get("price"):
