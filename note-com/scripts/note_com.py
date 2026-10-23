@@ -836,25 +836,57 @@ class NoteCom:
             payload["pay_body"] = paid_split[1]
             payload["separator"] = paid_separator_uuid
         else:
-            # FREE publish: note.com renders any body element flagged as
-            # separator (or a stale paid separator from a previous paid
-            # publish) as the paid-section cut -- the reader page then shows
-            # only a preview ending at that marker, even with price 0. Strip
-            # stray <hr ...uuid...> paid-cut markers and explicitly clear the
-            # paid state so the whole article is visible without paying.
+            # FREE publish: replicate the browser editor's exact publish PUT
+            # (ground truth captured 2026-10-23 in editor-note-com HAR, PUT
+            # https://note.com/api/v1/text_notes/{id}). The browser sends the
+            # whole article in free_body, separator=null, limited=false
+            # (NOT is_limited), slug, and the full default field set. Any
+            # deviation (e.g. sending is_limited/is_paid instead) leaves the
+            # reader page rendering the truncated paywall preview.
             existing_body = re.sub(
                 r'<hr[^>]*\b(?:name|id)="[0-9a-fA-F-]{36}"[^>]*>', "", existing_body)
-            payload["body"] = existing_body
-            payload["body_length"] = len(existing_body)
-            payload["free_body"] = existing_body
-            payload["pay_body"] = ""
-            payload["separator"] = ""
-            payload["is_paid"] = False
+            visible = re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", existing_body))
+            payload = {
+                "author_ids": [],
+                "body_length": len(visible),
+                "disable_comment": False,
+                "exclude_from_creator_top": False,
+                "exclude_ai_learning_reward": False,
+                "free_body": existing_body,
+                "image_keys": [],
+                "index": bool(publish and "<table-of-contents" in existing_body),
+                "is_refund": False,
+                "limited": False,
+                "magazine_ids": [],
+                "magazine_keys": [],
+                "name": title,
+                "pay_body": "",
+                "price": 0,
+                "send_notifications_flag": bool(publish),
+                "separator": None,
+                "slug": draft.get("slug") or ("slug-" + note_key),
+                "status": "published" if publish else "draft",
+                "circle_permissions": [],
+                "discount_campaigns": [],
+                "lead_form": {"is_active": False, "consent_url": ""},
+                "line_add_friend": {"is_active": False, "keyword": "", "add_friend_url": ""},
+                "pro_coupon_keys": [],
+            }
+            if hashtags is not None:
+                payload["hashtags"] = [_normalize_tag_str(t) for t in hashtags]
+            if eyecatch_url is not None:
+                payload["eyecatch_url"] = eyecatch_url
+            if eyecatch_image_id is not None:
+                payload["eyecatch_image_id"] = str(eyecatch_image_id)
         if publish:
             payload["status"] = "published"
-            if price is not None or draft.get("price"):
-                payload["is_paid"] = True
             payload["send_notifications_flag"] = True
+            # is_paid belongs ONLY to the paid-separator branch. Injecting it
+            # into the browser-shape free payload (e.g. a draft carrying a
+            # stale paid price) reintroduces the logged-out paywall-preview
+            # bug (verified 2026-10-23). Free branch must emit no is_paid.
+            if paid_separator_uuid is not None and (price is not None or draft.get("price")):
+                payload["is_paid"] = True
 
         headers = self._json_headers(note_key)
         resp = requests.put(
@@ -1493,6 +1525,13 @@ def main() -> int:
             result = client.add_to_magazine(args.magazine_id, args.note_key, note_id=getattr(args, "note_id", None))
             if result.get("success") or (isinstance(result, dict) and result.get("data", {}).get("status") == "success"):
                 print(f"Successfully added note_key={args.note_key} to magazine={args.magazine_id}")
+                data = result.get("data", {}) if isinstance(result, dict) else {}
+                if data.get("add_limited_note"):
+                    print("WARNING: API reported add_limited_note=true -- this magazine is a PAID magazine "
+                          "(even at price 0) and may re-flag the note is_limited, hiding it from logged-out "
+                          "readers. Verify logged-out visibility and republish via the browser-shape "
+                          "publish_draft if truncated. (2026-10-23: use free magazine ma1443d828dac.)",
+                          file=sys.stderr)
                 return 0
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 1
